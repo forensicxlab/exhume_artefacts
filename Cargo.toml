@@ -11,7 +11,7 @@ license = "GPL-2.0-or-later"
 anyhow = "1.0.100"
 serde_json = "1.0.145"
 evtx = "0.8.5"
-exhume_filesystem = { path = "../exhume_filesystem" }
+exhume_filesystem = "=0.3.3"
 log = "0.4.25"
 clap = { version = "4.5", features = ["cargo"] }
 clap-num = "1.1.1"
