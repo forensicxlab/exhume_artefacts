@@ -1,0 +1,19 @@
+[package]
+name = "exhume_artefacts"
+version = "0.1.0"
+edition = "2024"
+description = "This exhume module regroup all of the parsers maintained by the community to parse and extract artefact in a standardized way."
+documentation = "https://www.forensicxlab.com/docs/category/exhume---artefacts"
+authors = ["k1nd0ne"]
+license = "GPL-2.0-or-later"
+
+[dependencies]
+anyhow = "1.0.100"
+serde_json = "1.0.145"
+evtx = "0.8.5"
+exhume_filesystem = { path = "../exhume_filesystem" }
+log = "0.4.25"
+clap = { version = "4.5", features = ["cargo"] }
+clap-num = "1.1.1"
+env_logger = "0.11.6"
+exhume_body = "=0.3.4"
