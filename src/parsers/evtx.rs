@@ -1,3 +1,4 @@
+// exhume/members/exhume_artefacts/src/parsers/evtx.rs
 use anyhow::{Context, Result};
 use evtx::{EvtxParser as EvtxCrateParser, ParserSettings};
 use serde_json::json;
@@ -110,10 +111,19 @@ impl WindowsEvtxParser {
                     .clone()
                     .into_xml()
                     .context("EVTX: XML serialization failed")?;
+
                 // Serialize the record to JSON for the structured `json` field.
                 let js = record
                     .into_json_value()
                     .context("EVTX: JSON serialization failed")?;
+
+                // Normalize timestamps:
+                // - `timestamp` is RFC3339 (human-friendly)
+                // - `timestamp_unix` is Unix epoch seconds
+                // - `timestamp_unix_ms` is Unix epoch milliseconds
+                let ts_rfc3339 = xml.timestamp.to_rfc3339();
+                let ts_unix = xml.timestamp.timestamp();
+                let ts_unix_ms = xml.timestamp.timestamp_millis();
 
                 // Emit a normalized `ObjectParsed` representing the event.
                 sink(ObjectParsed {
@@ -122,7 +132,9 @@ impl WindowsEvtxParser {
                     text: xml.data,
                     json: json!({
                         "event_record_id": js.event_record_id,
-                        "timestamp": xml.timestamp.to_rfc3339(),
+                        "timestamp": ts_rfc3339,
+                        "timestamp_unix": ts_unix,
+                        "timestamp_unix_ms": ts_unix_ms,
                         "event": js.data
                     }),
                 })?;
