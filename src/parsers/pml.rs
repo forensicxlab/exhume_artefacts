@@ -25,7 +25,7 @@ pub struct StringTable {
 }
 
 impl StringTable {
-        /// Parses a string table from `table_offset`.
+    /// Parses a string table from `table_offset`.
     pub fn parse(reader: &mut dyn ReadSeek, table_offset: u64) -> Result<Self> {
         reader.seek(SeekFrom::Start(table_offset))?;
         let mut count_buf = [0u8; 4];
@@ -44,8 +44,8 @@ impl StringTable {
         }
 
         let mut strings = Vec::with_capacity(count);
-        for i in 0..count {
-            let pos = table_offset + offsets[i] as u64;
+        for off in offsets.iter().take(count) {
+            let pos = table_offset + *off as u64;
             reader.seek(SeekFrom::Start(pos))?;
 
             let mut len_buf = [0u8; 4];
@@ -79,7 +79,7 @@ impl StringTable {
         Ok(Self { strings })
     }
 
-        /// Returns a string by index if present.
+    /// Returns a string by index if present.
     pub fn get(&self, index: u32) -> Option<&String> {
         self.strings.get(index as usize)
     }
@@ -104,7 +104,7 @@ pub struct ProcessTable {
 }
 
 impl ProcessTable {
-        /// Parses a process table from `table_offset` and resolves string indices.
+    /// Parses a process table from `table_offset` and resolves string indices.
     pub fn parse(
         reader: &mut dyn ReadSeek,
         table_offset: u64,
@@ -331,7 +331,11 @@ fn read_detail_string(cursor: &mut Cursor<&[u8]>, info: (bool, usize)) -> Option
     if is_ascii {
         let mut bytes = vec![0u8; char_count];
         cursor.read_exact(&mut bytes).ok()?;
-        Some(String::from_utf8_lossy(&bytes).trim_matches('\0').to_string())
+        Some(
+            String::from_utf8_lossy(&bytes)
+                .trim_matches('\0')
+                .to_string(),
+        )
     } else {
         let byte_len = char_count.checked_mul(2)?;
         let mut bytes = vec![0u8; byte_len];
@@ -340,7 +344,11 @@ fn read_detail_string(cursor: &mut Cursor<&[u8]>, info: (bool, usize)) -> Option
             .chunks_exact(2)
             .map(|c| u16::from_le_bytes([c[0], c[1]]))
             .collect();
-        Some(String::from_utf16_lossy(&utf16).trim_matches('\0').to_string())
+        Some(
+            String::from_utf16_lossy(&utf16)
+                .trim_matches('\0')
+                .to_string(),
+        )
     }
 }
 
@@ -387,7 +395,10 @@ fn read_exact_vec(cursor: &mut Cursor<&[u8]>, len: usize) -> Option<Vec<u8>> {
 }
 
 fn decode_registry_data(cursor: &mut Cursor<&[u8]>, reg_type: u32, length: usize) -> Option<Value> {
-    let available = cursor.get_ref().len().saturating_sub(cursor.position() as usize);
+    let available = cursor
+        .get_ref()
+        .len()
+        .saturating_sub(cursor.position() as usize);
     let n = length.min(available);
     if n == 0 {
         return None;
@@ -402,7 +413,11 @@ fn decode_registry_data(cursor: &mut Cursor<&[u8]>, reg_type: u32, length: usize
                 .chunks_exact(2)
                 .map(|c| u16::from_le_bytes([c[0], c[1]]))
                 .collect();
-            Some(json!(String::from_utf16_lossy(&utf16).trim_matches('\0').to_string()))
+            Some(json!(
+                String::from_utf16_lossy(&utf16)
+                    .trim_matches('\0')
+                    .to_string()
+            ))
         }
         7 => {
             let bytes = read_exact_vec(cursor, n)?;
@@ -680,13 +695,11 @@ fn parse_registry_details(
         out.insert("path".to_string(), json!(path));
     }
 
-    if let Some(info) = new_path_info {
-        if let Some(new_path) = read_detail_string(&mut io, info) {
-            if !new_path.is_empty() {
+    if let Some(info) = new_path_info
+        && let Some(new_path) = read_detail_string(&mut io, info)
+            && !new_path.is_empty() {
                 out.insert("new_path".to_string(), json!(new_path));
             }
-        }
-    }
 
     if let Some(index) = enum_index {
         out.insert("index".to_string(), json!(index));
@@ -697,16 +710,18 @@ fn parse_registry_details(
     }
 
     if let Some(access) = desired_access {
-        out.insert("desired_access".to_string(), json!(registry_access_mask_string(access)));
+        out.insert(
+            "desired_access".to_string(),
+            json!(registry_access_mask_string(access)),
+        );
     }
 
-    let mut extra_cursor = if let Some(extra) = extra_blob {
-        Some(Cursor::new(extra))
-    } else {
-        None
-    };
+    let mut extra_cursor = extra_blob.map(Cursor::new);
 
-    if matches!(op_name, "RegSetValue" | "RegSetInfoKey" | "RegLoadKey" | "RegRenameKey") {
+    if matches!(
+        op_name,
+        "RegSetValue" | "RegSetInfoKey" | "RegLoadKey" | "RegRenameKey"
+    ) {
         let pos = io.position() as usize;
         if pos < details_blob.len() {
             extra_cursor = Some(Cursor::new(&details_blob[pos..]));
@@ -720,21 +735,21 @@ fn parse_registry_details(
                 let second = read_u32(cur);
 
                 if op_name == "RegOpenKey" {
-                    if desired_access.unwrap_or(0) & 0x2000000 != 0 {
-                        if let Some(granted) = first {
-                            out.insert("granted_access".to_string(), json!(registry_access_mask_string(granted)));
+                    if desired_access.unwrap_or(0) & 0x2000000 != 0
+                        && let Some(granted) = first {
+                            out.insert(
+                                "granted_access".to_string(),
+                                json!(registry_access_mask_string(granted)),
+                            );
                         }
-                    }
-                } else {
-                    if let Some(disposition) = second {
-                        let disposition_name = match disposition {
-                            1 => Some("REG_CREATED_NEW_KEY"),
-                            2 => Some("REG_OPENED_EXISTING_KEY"),
-                            _ => None,
-                        };
-                        if let Some(name) = disposition_name {
-                            out.insert("disposition".to_string(), json!(name));
-                        }
+                } else if let Some(disposition) = second {
+                    let disposition_name = match disposition {
+                        1 => Some("REG_CREATED_NEW_KEY"),
+                        2 => Some("REG_OPENED_EXISTING_KEY"),
+                        _ => None,
+                    };
+                    if let Some(name) = disposition_name {
+                        out.insert("disposition".to_string(), json!(name));
                     }
                 }
             }
@@ -757,7 +772,9 @@ fn parse_registry_details(
                                 .chunks_exact(2)
                                 .map(|c| u16::from_le_bytes([c[0], c[1]]))
                                 .collect();
-                            let name = String::from_utf16_lossy(&utf16).trim_matches('\0').to_string();
+                            let name = String::from_utf16_lossy(&utf16)
+                                .trim_matches('\0')
+                                .to_string();
                             if !name.is_empty() {
                                 out.insert("value_name".to_string(), json!(name));
                             }
@@ -784,11 +801,10 @@ fn parse_registry_details(
                 let n = length_hint
                     .unwrap_or_default()
                     .min(data_length_hint.unwrap_or_default()) as usize;
-                if let Some(cur) = extra_cursor.as_mut() {
-                    if let Some(data) = decode_registry_data(cur, reg_type, n) {
+                if let Some(cur) = extra_cursor.as_mut()
+                    && let Some(data) = decode_registry_data(cur, reg_type, n) {
                         out.insert("data".to_string(), data);
                     }
-                }
             }
         }
         _ => {}
@@ -831,7 +847,10 @@ fn try_parse_filesystem_details(
 
     if op_name == "CreateFile" {
         if let Some(desired_access) = read_u32(&mut io) {
-            out.insert("desired_access".to_string(), json!(filesystem_access_mask_string(desired_access)));
+            out.insert(
+                "desired_access".to_string(),
+                json!(filesystem_access_mask_string(desired_access)),
+            );
         }
         let impersonating_sid_length = read_u8(&mut io).unwrap_or(0) as usize;
         let _ = skip(&mut io, 3);
@@ -844,7 +863,10 @@ fn try_parse_filesystem_details(
         if let Some(disposition_and_options) = read_u32(&mut details_io) {
             let disposition = disposition_and_options >> 24;
             let options = disposition_and_options & 0x00ff_ffff;
-            out.insert("disposition".to_string(), json!(filesystem_disposition_string(disposition)));
+            out.insert(
+                "disposition".to_string(),
+                json!(filesystem_disposition_string(disposition)),
+            );
             let options_text = filesystem_options_string(options);
             if !options_text.is_empty() {
                 out.insert("options".to_string(), json!(options_text));
@@ -857,8 +879,14 @@ fn try_parse_filesystem_details(
 
         let attributes = read_u16(&mut details_io).unwrap_or(0) as u32;
         let share_mode = read_u16(&mut details_io).unwrap_or(0) as u32;
-        out.insert("attributes".to_string(), json!(filesystem_attributes_string(attributes)));
-        out.insert("share_mode".to_string(), json!(filesystem_share_mode_string(share_mode)));
+        out.insert(
+            "attributes".to_string(),
+            json!(filesystem_attributes_string(attributes)),
+        );
+        out.insert(
+            "share_mode".to_string(),
+            json!(filesystem_share_mode_string(share_mode)),
+        );
 
         let _ = skip(&mut details_io, 0x4 + ptr_size * 2);
         if let Some(allocation) = read_u32(&mut details_io) {
@@ -869,19 +897,25 @@ fn try_parse_filesystem_details(
             }
         }
 
-        if impersonating_sid_length > 0 {
-            if let Some(sid_raw) = read_exact_vec(&mut io, impersonating_sid_length) {
-                out.insert("impersonating_sid_raw".to_string(), json!(format!("{:x?}", sid_raw)));
+        if impersonating_sid_length > 0
+            && let Some(sid_raw) = read_exact_vec(&mut io, impersonating_sid_length) {
+                out.insert(
+                    "impersonating_sid_raw".to_string(),
+                    json!(format!("{:x?}", sid_raw)),
+                );
             }
-        }
 
         if let Some(extra) = extra_blob {
             let mut extra_io = Cursor::new(extra);
             if let Some(open_result) = read_u32(&mut extra_io) {
-                out.insert("open_result".to_string(), json!(filesystem_open_result_string(open_result)));
+                out.insert(
+                    "open_result".to_string(),
+                    json!(filesystem_open_result_string(open_result)),
+                );
             }
         }
-    } else if op_name == "SetDispositionInformationFile" || op_name == "SetDispositionInformationEx" {
+    } else if op_name == "SetDispositionInformationFile" || op_name == "SetDispositionInformationEx"
+    {
         let _ = skip(&mut details_io, 4);
         if let Some(delete_flag) = read_u8(&mut details_io) {
             out.insert("delete".to_string(), json!(delete_flag != 0));
@@ -949,11 +983,14 @@ fn try_parse_filesystem_details(
 
         out.insert("length".to_string(), json!(length));
         out.insert("offset".to_string(), json!(offset));
-        out.insert("io_flags_priority".to_string(), json!(format!("0x{:x}", io_flags_priority)));
-    } else if op_name == "QueryDirectory" {
-        if let Some(filter_info) = read_detail_string_info(&mut io) {
-            if let Some(filter) = read_detail_string(&mut io, filter_info) {
-                if !filter.is_empty() {
+        out.insert(
+            "io_flags_priority".to_string(),
+            json!(format!("0x{:x}", io_flags_priority)),
+        );
+    } else if op_name == "QueryDirectory"
+        && let Some(filter_info) = read_detail_string_info(&mut io)
+            && let Some(filter) = read_detail_string(&mut io, filter_info)
+                && !filter.is_empty() {
                     out.insert("filter".to_string(), json!(filter.clone()));
                     if let Some(current_path) = out.get("path").and_then(|v| v.as_str()) {
                         let full = if current_path.ends_with('\\') {
@@ -964,14 +1001,15 @@ fn try_parse_filesystem_details(
                         out.insert("path".to_string(), json!(full));
                     }
                 }
-            }
-        }
-    }
 
     Some(out)
 }
 
-fn try_parse_process_details(details_blob: &[u8], op_name: &str, ptr_size: usize) -> Option<Map<String, Value>> {
+fn try_parse_process_details(
+    details_blob: &[u8],
+    op_name: &str,
+    ptr_size: usize,
+) -> Option<Map<String, Value>> {
     let mut io = Cursor::new(details_blob);
     let mut out = Map::new();
 
@@ -1298,7 +1336,11 @@ fn result_text(status: u32) -> &'static str {
 
 fn derive_category(event_class: u32, op_name: &str, details: &Map<String, Value>) -> &'static str {
     if event_class == 2 {
-        if op_name.starts_with("RegSet") || op_name.starts_with("RegDelete") || op_name == "RegRenameKey" || op_name == "RegLoadKey" {
+        if op_name.starts_with("RegSet")
+            || op_name.starts_with("RegDelete")
+            || op_name == "RegRenameKey"
+            || op_name == "RegLoadKey"
+        {
             return "Write";
         }
         if op_name.ends_with("Security") {
@@ -1311,21 +1353,39 @@ fn derive_category(event_class: u32, op_name: &str, details: &Map<String, Value>
     }
 
     if event_class == 3 {
-        if op_name.starts_with("Query") || matches!(op_name, "ReadFile" | "ReadFile2" | "QueryEAFile" | "NotifyChangeDirectory" | "QueryOpen") {
+        if op_name.starts_with("Query")
+            || matches!(
+                op_name,
+                "ReadFile" | "ReadFile2" | "QueryEAFile" | "NotifyChangeDirectory" | "QueryOpen"
+            )
+        {
             return "Read";
         }
-        if op_name.starts_with("Set") || matches!(op_name, "WriteFile" | "WriteFile2" | "SetEAFile" | "SetSecurityFile" | "SetFileQuota" | "SetDispositionInformationFile" | "SetDispositionInformationEx") {
+        if op_name.starts_with("Set")
+            || matches!(
+                op_name,
+                "WriteFile"
+                    | "WriteFile2"
+                    | "SetEAFile"
+                    | "SetSecurityFile"
+                    | "SetFileQuota"
+                    | "SetDispositionInformationFile"
+                    | "SetDispositionInformationEx"
+            )
+        {
             return "Write";
         }
         if op_name == "DeviceIoControl" || op_name == "FileSystemControl" {
             return "Read/Write Metadata";
         }
         if op_name == "CreateFile" {
-            if let Some(d) = details.get("disposition").and_then(|v| v.as_str()) {
-                if matches!(d, "Create" | "OpenIf" | "Overwrite" | "OverwriteIf" | "Supersede") {
+            if let Some(d) = details.get("disposition").and_then(|v| v.as_str())
+                && matches!(
+                    d,
+                    "Create" | "OpenIf" | "Overwrite" | "OverwriteIf" | "Supersede"
+                ) {
                     return "Write";
                 }
-            }
             return "Read";
         }
         return "Other";
@@ -1355,7 +1415,11 @@ fn should_emit_raw(
     if event_class == 1
         && matches!(
             op_name,
-            "Thread Create" | "Thread Exit" | "Process Exit" | "Process Statistics" | "System Statistics"
+            "Thread Create"
+                | "Thread Exit"
+                | "Process Exit"
+                | "Process Statistics"
+                | "System Statistics"
         )
     {
         return false;
@@ -1382,8 +1446,8 @@ fn extract_raw_details(blob: &[u8]) -> Option<String> {
     let max_off = blob.len().min(16);
     for off in 0..max_off {
         let mut io = Cursor::new(&blob[off..]);
-        if let Some(info) = read_detail_string_info(&mut io) {
-            if let Some(candidate) = read_detail_string(&mut io, info) {
+        if let Some(info) = read_detail_string_info(&mut io)
+            && let Some(candidate) = read_detail_string(&mut io, info) {
                 let trimmed = candidate.trim_matches('\0').trim().to_string();
                 if trimmed.is_empty() {
                     continue;
@@ -1394,7 +1458,6 @@ fn extract_raw_details(blob: &[u8]) -> Option<String> {
                     best = Some(trimmed);
                 }
             }
-        }
     }
     if best.is_some() {
         return best;
@@ -1426,7 +1489,7 @@ fn extract_raw_details(blob: &[u8]) -> Option<String> {
 }
 
 impl WindowsPmlParser {
-        /// Parses events from a seekable reader and streams normalized records into `sink`.
+    /// Parses events from a seekable reader and streams normalized records into `sink`.
     fn parse_reader(
         &self,
         mut reader: Box<dyn ReadSeek + '_>,
@@ -1546,19 +1609,27 @@ impl WindowsPmlParser {
             });
 
             if let Some(details_obj) = details.as_object_mut() {
-                for (k, v) in parse_event_details(&details_blob, extra_details_blob.as_deref(), event_class, &op_name, ptr_size) {
+                for (k, v) in parse_event_details(
+                    &details_blob,
+                    extra_details_blob.as_deref(),
+                    event_class,
+                    &op_name,
+                    ptr_size,
+                ) {
                     details_obj.insert(k, v);
                 }
 
-                if let Some(proto_op) = details_obj.get("operation_with_protocol").and_then(|v| v.as_str()) {
+                if let Some(proto_op) = details_obj
+                    .get("operation_with_protocol")
+                    .and_then(|v| v.as_str())
+                {
                     op_name = proto_op.to_string();
                 }
 
-                if should_emit_raw(&details_blob, event_class, &op_name, details_obj) {
-                    if let Some(raw) = extract_raw_details(&details_blob) {
+                if should_emit_raw(&details_blob, event_class, &op_name, details_obj)
+                    && let Some(raw) = extract_raw_details(&details_blob) {
                         details_obj.insert("raw".to_string(), json!(raw));
                     }
-                }
             }
 
             if let Some(proc) = process_table.processes.get(&process_idx) {
@@ -1579,7 +1650,10 @@ impl WindowsPmlParser {
                 .unwrap_or("Other");
             let parse_quality = details_obj_ref
                 .map(|m| {
-                    if m.contains_key("path") || m.contains_key("data") || m.contains_key("desired_access") {
+                    if m.contains_key("path")
+                        || m.contains_key("data")
+                        || m.contains_key("desired_access")
+                    {
                         "high"
                     } else if m.contains_key("raw") {
                         "medium"
@@ -1629,7 +1703,6 @@ impl WindowsPmlParser {
             };
 
             sink(obj)?;
-
         }
 
         Ok(())

@@ -231,78 +231,78 @@ impl Parser for WindowsPeParser {
             })
             .collect();
 
-let debug_data: Vec<serde_json::Value> = pe
-    .debug_data
-    .iter()
-    .map(|d| {
-        // PDB 2.0 (NB10)
-        let pdb20 = d.codeview_pdb20_debug_info.as_ref().map(|cv| {
-            serde_json::json!({
-                "kind": "codeview_pdb20",
-                "codeview_signature": format!("0x{:08x}", cv.codeview_signature),
-                "codeview_offset": cv.codeview_offset,
-                "signature": format!("0x{:08x}", cv.signature),
-                "age": cv.age,
-                "filename": String::from_utf8_lossy(cv.filename).to_string(),
+        let debug_data: Vec<serde_json::Value> = pe
+            .debug_data
+            .iter()
+            .map(|d| {
+                // PDB 2.0 (NB10)
+                let pdb20 = d.codeview_pdb20_debug_info.as_ref().map(|cv| {
+                    serde_json::json!({
+                        "kind": "codeview_pdb20",
+                        "codeview_signature": format!("0x{:08x}", cv.codeview_signature),
+                        "codeview_offset": cv.codeview_offset,
+                        "signature": format!("0x{:08x}", cv.signature),
+                        "age": cv.age,
+                        "filename": String::from_utf8_lossy(cv.filename).to_string(),
+                    })
+                });
+
+                // PDB 7.0 (RSDS) — field layout can vary; safest is Debug string
+                let pdb70 = d.codeview_pdb70_debug_info.as_ref().map(|cv| {
+                    serde_json::json!({
+                        "kind": "codeview_pdb70",
+                        "debug": format!("{:?}", cv),
+                    })
+                });
+
+                let vcfeature = d.vcfeature_info.as_ref().map(|v| {
+                    serde_json::json!({
+                        "kind": "vcfeature",
+                        "pre_vc_plusplus_count": v.pre_vc_plusplus_count,
+                        "c_and_cplusplus_count": v.c_and_cplusplus_count,
+                        "guard_stack_count": v.guard_stack_count,
+                        "sdl_count": v.sdl_count,
+                        "guard_count": v.guard_count,
+                    })
+                });
+
+                let ex_dll = d.ex_dll_characteristics_info.as_ref().map(|x| {
+                    serde_json::json!({
+                        "kind": "ex_dll_characteristics",
+                        "characteristics_ex": format!("0x{:08x}", x.characteristics_ex),
+                    })
+                });
+
+                let repro = d.repro_info.as_ref().map(|r| match r {
+                    goblin::pe::debug::ReproInfo::TimeDateStamp(ts) => serde_json::json!({
+                        "kind": "repro",
+                        "time_date_stamp": ts,
+                    }),
+                    goblin::pe::debug::ReproInfo::Buffer { length, buffer } => serde_json::json!({
+                        "kind": "repro",
+                        "length": length,
+                        "buffer_hex": hex::encode(buffer),
+                    }),
+                });
+
+                let pogo = d.pogo_info.as_ref().map(|p| {
+                    // You can go deeper (iterate entries) later; for now keep it robust:
+                    serde_json::json!({
+                        "kind": "pogo",
+                        "debug": format!("{:?}", p),
+                    })
+                });
+
+                serde_json::json!({
+                    "pdb20": pdb20,
+                    "pdb70": pdb70,
+                    "vcfeature": vcfeature,
+                    "ex_dll_characteristics": ex_dll,
+                    "repro": repro,
+                    "pogo": pogo,
+                })
             })
-        });
-
-        // PDB 7.0 (RSDS) — field layout can vary; safest is Debug string
-        let pdb70 = d.codeview_pdb70_debug_info.as_ref().map(|cv| {
-            serde_json::json!({
-                "kind": "codeview_pdb70",
-                "debug": format!("{:?}", cv),
-            })
-        });
-
-        let vcfeature = d.vcfeature_info.as_ref().map(|v| {
-            serde_json::json!({
-                "kind": "vcfeature",
-                "pre_vc_plusplus_count": v.pre_vc_plusplus_count,
-                "c_and_cplusplus_count": v.c_and_cplusplus_count,
-                "guard_stack_count": v.guard_stack_count,
-                "sdl_count": v.sdl_count,
-                "guard_count": v.guard_count,
-            })
-        });
-
-        let ex_dll = d.ex_dll_characteristics_info.as_ref().map(|x| {
-            serde_json::json!({
-                "kind": "ex_dll_characteristics",
-                "characteristics_ex": format!("0x{:08x}", x.characteristics_ex),
-            })
-        });
-
-        let repro = d.repro_info.as_ref().map(|r| match r {
-            goblin::pe::debug::ReproInfo::TimeDateStamp(ts) => serde_json::json!({
-                "kind": "repro",
-                "time_date_stamp": ts,
-            }),
-            goblin::pe::debug::ReproInfo::Buffer { length, buffer } => serde_json::json!({
-                "kind": "repro",
-                "length": length,
-                "buffer_hex": hex::encode(buffer),
-            }),
-        });
-
-        let pogo = d.pogo_info.as_ref().map(|p| {
-            // You can go deeper (iterate entries) later; for now keep it robust:
-            serde_json::json!({
-                "kind": "pogo",
-                "debug": format!("{:?}", p),
-            })
-        });
-
-        serde_json::json!({
-            "pdb20": pdb20,
-            "pdb70": pdb70,
-            "vcfeature": vcfeature,
-            "ex_dll_characteristics": ex_dll,
-            "repro": repro,
-            "pogo": pogo,
-        })
-    })
-    .collect();
+            .collect();
 
         let resources = pe.resource_data.as_ref().map(|r| {
             // Manifest is commonly UTF-8 XML, but be defensive.
@@ -342,17 +342,15 @@ let debug_data: Vec<serde_json::Value> = pe
 
             // Enumerate top-level resource entries (type layer).
             let mut top_level = Vec::new();
-            for entry_res in r.entries().take(256) {
-                if let Ok(e) = entry_res {
-                    top_level.push(json!({
-                        "id": e.id(),                         // Some(u16) if ID-based; None if name-based
-                        "name_is_string": e.name_is_string(), // if true, id() is None
-                        "name_offset": format!("0x{:x}", e.name_offset()),
-                        "data_is_directory": e.data_is_directory(),
-                        "offset_to_directory": format!("0x{:x}", e.offset_to_directory()),
-                        "offset_to_data": e.offset_to_data().map(|x| format!("0x{:x}", x)),
-                    }));
-                }
+            for e in r.entries().take(256).flatten() {
+                top_level.push(json!({
+                    "id": e.id(),                         // Some(u16) if ID-based; None if name-based
+                    "name_is_string": e.name_is_string(), // if true, id() is None
+                    "name_offset": format!("0x{:x}", e.name_offset()),
+                    "data_is_directory": e.data_is_directory(),
+                    "offset_to_directory": format!("0x{:x}", e.offset_to_directory()),
+                    "offset_to_data": e.offset_to_data().map(|x| format!("0x{:x}", x)),
+                }));
             }
 
             json!({
