@@ -1,6 +1,6 @@
 [package]
 name = "exhume_artefacts"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2024"
 description = "This exhume module regroup all of the parsers maintained by the community to parse and extract artefact in a standardized way."
 documentation = "https://www.forensicxlab.com/docs/category/exhume---artefacts"
