@@ -16,7 +16,7 @@ pub fn build_registry() -> ParserRegistry {
 
     m.insert(
         "windows_pe",
-        Arc::new(pe::WindowsPeParser) as Arc<dyn Parser>,
+        Arc::new(pe::WindowsPeParser::default()) as Arc<dyn Parser>,
     );
 
     m.insert(
