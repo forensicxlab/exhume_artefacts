@@ -2,7 +2,7 @@
 //!
 //! This module decodes PML records into normalized JSON events for investigation workflows.
 
-use crate::core::{ObjectParsed, Parser, ParserInput, ReadSeek};
+use crate::core::{ObjectParsed, Parser, ParserInput, ReadSeek, TimelineEvent};
 use anyhow::{Result, anyhow};
 use scroll::{LE, Pread};
 use serde_json::{Map, Value, json};
@@ -697,9 +697,10 @@ fn parse_registry_details(
 
     if let Some(info) = new_path_info
         && let Some(new_path) = read_detail_string(&mut io, info)
-            && !new_path.is_empty() {
-                out.insert("new_path".to_string(), json!(new_path));
-            }
+        && !new_path.is_empty()
+    {
+        out.insert("new_path".to_string(), json!(new_path));
+    }
 
     if let Some(index) = enum_index {
         out.insert("index".to_string(), json!(index));
@@ -736,12 +737,13 @@ fn parse_registry_details(
 
                 if op_name == "RegOpenKey" {
                     if desired_access.unwrap_or(0) & 0x2000000 != 0
-                        && let Some(granted) = first {
-                            out.insert(
-                                "granted_access".to_string(),
-                                json!(registry_access_mask_string(granted)),
-                            );
-                        }
+                        && let Some(granted) = first
+                    {
+                        out.insert(
+                            "granted_access".to_string(),
+                            json!(registry_access_mask_string(granted)),
+                        );
+                    }
                 } else if let Some(disposition) = second {
                     let disposition_name = match disposition {
                         1 => Some("REG_CREATED_NEW_KEY"),
@@ -802,9 +804,10 @@ fn parse_registry_details(
                     .unwrap_or_default()
                     .min(data_length_hint.unwrap_or_default()) as usize;
                 if let Some(cur) = extra_cursor.as_mut()
-                    && let Some(data) = decode_registry_data(cur, reg_type, n) {
-                        out.insert("data".to_string(), data);
-                    }
+                    && let Some(data) = decode_registry_data(cur, reg_type, n)
+                {
+                    out.insert("data".to_string(), data);
+                }
             }
         }
         _ => {}
@@ -898,12 +901,13 @@ fn try_parse_filesystem_details(
         }
 
         if impersonating_sid_length > 0
-            && let Some(sid_raw) = read_exact_vec(&mut io, impersonating_sid_length) {
-                out.insert(
-                    "impersonating_sid_raw".to_string(),
-                    json!(format!("{:x?}", sid_raw)),
-                );
-            }
+            && let Some(sid_raw) = read_exact_vec(&mut io, impersonating_sid_length)
+        {
+            out.insert(
+                "impersonating_sid_raw".to_string(),
+                json!(format!("{:x?}", sid_raw)),
+            );
+        }
 
         if let Some(extra) = extra_blob {
             let mut extra_io = Cursor::new(extra);
@@ -989,18 +993,19 @@ fn try_parse_filesystem_details(
         );
     } else if op_name == "QueryDirectory"
         && let Some(filter_info) = read_detail_string_info(&mut io)
-            && let Some(filter) = read_detail_string(&mut io, filter_info)
-                && !filter.is_empty() {
-                    out.insert("filter".to_string(), json!(filter.clone()));
-                    if let Some(current_path) = out.get("path").and_then(|v| v.as_str()) {
-                        let full = if current_path.ends_with('\\') {
-                            format!("{}{}", current_path, filter)
-                        } else {
-                            format!("{}\\{}", current_path, filter)
-                        };
-                        out.insert("path".to_string(), json!(full));
-                    }
-                }
+        && let Some(filter) = read_detail_string(&mut io, filter_info)
+        && !filter.is_empty()
+    {
+        out.insert("filter".to_string(), json!(filter.clone()));
+        if let Some(current_path) = out.get("path").and_then(|v| v.as_str()) {
+            let full = if current_path.ends_with('\\') {
+                format!("{}{}", current_path, filter)
+            } else {
+                format!("{}\\{}", current_path, filter)
+            };
+            out.insert("path".to_string(), json!(full));
+        }
+    }
 
     Some(out)
 }
@@ -1383,9 +1388,10 @@ fn derive_category(event_class: u32, op_name: &str, details: &Map<String, Value>
                 && matches!(
                     d,
                     "Create" | "OpenIf" | "Overwrite" | "OverwriteIf" | "Supersede"
-                ) {
-                    return "Write";
-                }
+                )
+            {
+                return "Write";
+            }
             return "Read";
         }
         return "Other";
@@ -1447,17 +1453,18 @@ fn extract_raw_details(blob: &[u8]) -> Option<String> {
     for off in 0..max_off {
         let mut io = Cursor::new(&blob[off..]);
         if let Some(info) = read_detail_string_info(&mut io)
-            && let Some(candidate) = read_detail_string(&mut io, info) {
-                let trimmed = candidate.trim_matches('\0').trim().to_string();
-                if trimmed.is_empty() {
-                    continue;
-                }
-                let score = score_detail_candidate(&trimmed);
-                if score > best_score {
-                    best_score = score;
-                    best = Some(trimmed);
-                }
+            && let Some(candidate) = read_detail_string(&mut io, info)
+        {
+            let trimmed = candidate.trim_matches('\0').trim().to_string();
+            if trimmed.is_empty() {
+                continue;
             }
+            let score = score_detail_candidate(&trimmed);
+            if score > best_score {
+                best_score = score;
+                best = Some(trimmed);
+            }
+        }
     }
     if best.is_some() {
         return best;
@@ -1627,9 +1634,10 @@ impl WindowsPmlParser {
                 }
 
                 if should_emit_raw(&details_blob, event_class, &op_name, details_obj)
-                    && let Some(raw) = extract_raw_details(&details_blob) {
-                        details_obj.insert("raw".to_string(), json!(raw));
-                    }
+                    && let Some(raw) = extract_raw_details(&details_blob)
+                {
+                    details_obj.insert("raw".to_string(), json!(raw));
+                }
             }
 
             if let Some(proc) = process_table.processes.get(&process_idx) {
@@ -1718,6 +1726,27 @@ impl Parser for WindowsPmlParser {
         "Parser for ProcMon PML files (v9)."
     }
 
+    fn extract_timeline_events(&self, obj: &ObjectParsed) -> Vec<TimelineEvent> {
+        let Some(ts_unix_ms) = obj.json["timestamp_unix_ms"].as_i64() else {
+            return Vec::new();
+        };
+        let operation = obj.json["operation"].as_str().unwrap_or("");
+        let process = obj.json["details"]["process_name"].as_str().unwrap_or("");
+        let path = obj.json["details"]["path"].as_str().unwrap_or("");
+        let description = if path.is_empty() {
+            format!("{operation} [{process}]")
+        } else {
+            format!("{operation} [{process}] {path}")
+        };
+        let actor = obj.json["details"]["user"].as_str().map(str::to_owned);
+        vec![TimelineEvent {
+            ts_unix_ms,
+            event_type: "windows.pml.event",
+            description: Some(description),
+            actor,
+        }]
+    }
+
     fn run_into(
         &self,
         input: ParserInput,
@@ -1733,6 +1762,9 @@ impl Parser for WindowsPmlParser {
                 self.parse_reader(Box::new(cursor), sink)
             }
             ParserInput::ReadSeek(reader) => self.parse_reader(reader, sink),
+            ParserInput::Compound(_) => {
+                anyhow::bail!("windows_pml does not support compound parser input")
+            }
         }
     }
 }

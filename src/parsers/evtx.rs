@@ -5,7 +5,7 @@ use serde_json::json;
 use std::io::{Read, Seek, SeekFrom};
 use std::sync::Arc;
 
-use crate::core::{ObjectParsed, Parser, ParserInput};
+use crate::core::{ObjectParsed, Parser, ParserInput, TimelineEvent};
 
 /// Parser for Windows EVTX event log files.
 ///
@@ -146,9 +146,23 @@ impl WindowsEvtxParser {
 }
 
 impl Parser for WindowsEvtxParser {
-    /// Return the stable name of this parser implementation.
     fn name(&self) -> &'static str {
         "windows_evtx"
+    }
+
+    fn extract_timeline_events(&self, obj: &ObjectParsed) -> Vec<TimelineEvent> {
+        let Some(ts_unix_ms) = obj.json["timestamp_unix_ms"].as_i64() else {
+            return Vec::new();
+        };
+        let description = obj.json["event_record_id"]
+            .as_i64()
+            .map(|id| format!("EventRecordID={id}"));
+        vec![TimelineEvent {
+            ts_unix_ms,
+            event_type: "windows.evtx.event",
+            description,
+            actor: None,
+        }]
     }
 
     /// Human-readable description of what this parser does.
@@ -189,6 +203,9 @@ impl Parser for WindowsEvtxParser {
                 rs.seek(SeekFrom::Start(0))?;
                 let parser = evtx::EvtxParser::from_read_seek(rs)?;
                 self.run_with_parser(parser, sink)
+            }
+            ParserInput::Compound(_) => {
+                anyhow::bail!("windows_evtx does not support compound parser input")
             }
         }
     }

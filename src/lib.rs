@@ -5,7 +5,10 @@ pub mod parsers;
 
 use crate::parsers::ParserRegistry;
 use anyhow::Result;
-pub use core::{ObjectParsed, Parser, ParserInfo, ParserInput};
+pub use core::{
+    CompanionPathRule, CompanionSpec, CompoundParserInput, ObjectParsed, Parser,
+    ParserFileProvider, ParserInfo, ParserInput, ParserSource, TimelineEvent,
+};
 
 /// Return a sorted list of metadata describing all registered parsers.
 ///

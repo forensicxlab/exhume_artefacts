@@ -125,7 +125,7 @@ fn main() -> anyhow::Result<()> {
     let body = Body::new(body_path.to_owned(), format);
     let partition_size_bytes = fs_size_sectors * body.get_sector_size() as u64;
 
-    let mut fs = detect_filesystem(&body, fs_offset, partition_size_bytes)
+    let mut fs = detect_filesystem(&body, fs_offset, partition_size_bytes, None)
         .map_err(|e| anyhow::anyhow!("filesystem detection failed: {e:?}"))?;
 
     // Fetch the target file record from the filesystem.

@@ -1,6 +1,6 @@
 use anyhow::Result;
 
-use super::{ObjectParsed, ParserInput};
+use super::{CompanionSpec, ObjectParsed, ParserInput, TimelineEvent};
 
 /// A trait representing a generic parser that can process input into parsed objects.
 ///
@@ -16,6 +16,20 @@ pub trait Parser: Send + Sync {
     /// are encouraged to override it with a more detailed description.
     fn description(&self) -> &'static str {
         "No description provided."
+    }
+
+    /// Companion files this parser can consume when launched from an indexed
+    /// evidence source.
+    fn companion_specs(&self) -> &'static [CompanionSpec] {
+        &[]
+    }
+
+    /// Extract zero or more timeline events from a parsed object for the supertimeline.
+    ///
+    /// The default implementation returns an empty vector. Parsers with temporal
+    /// data should override this method to feed the unified `timeline_events` table.
+    fn extract_timeline_events(&self, _obj: &ObjectParsed) -> Vec<TimelineEvent> {
+        Vec::new()
     }
 
     /// Runs the parser on the given `input`, sending each parsed object to `sink`.

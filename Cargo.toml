@@ -1,21 +1,27 @@
 [package]
 name = "exhume_artefacts"
-version = "0.2.6"
+version = "0.3.0"
 edition = "2024"
-description = "This exhume module regroup all of the parsers maintained by the community to parse and extract artefact in a standardized way."
+description = "Digital forensics artefact parser library and CLI for Exhume."
+repository = "https://github.com/forensicxlab/exhume"
 documentation = "https://www.forensicxlab.com/docs/category/exhume---artefacts"
+readme = "README.md"
 authors = ["k1nd0ne"]
 license = "GPL-2.0-or-later"
+keywords = ["forensics", "dfir", "artefacts", "parsers", "exhume"]
 
 [dependencies]
 anyhow = "1.0.100"
+base64 = "0.22"
 serde_json = "1.0.145"
+chrono = "0.4"
 evtx = "0.8.5"
 goblin = "0.10"
 md5 = "0.7"
 sha2 = "0.10"
 sha-1 = "0.10"
 hex = "0.4"
+libsqlite3-sys = "0.30.1"
 scroll = "0.12"
 exhume_filesystem = "=0.5.2"
 log = "0.4.25"
@@ -23,3 +29,4 @@ clap = { version = "4.5", features = ["cargo"] }
 clap-num = "1.1.1"
 env_logger = "0.11.6"
 exhume_body = "=0.5.5"
+tempfile = "3.26.0"

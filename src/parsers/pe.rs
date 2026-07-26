@@ -155,6 +155,9 @@ impl Parser for WindowsPeParser {
                 rs.read_to_end(&mut b)?;
                 b
             }
+            ParserInput::Compound(_) => {
+                anyhow::bail!("windows_pe does not support compound parser input")
+            }
         };
 
         let pe = PE::parse(&data).context("failed to parse PE file")?;
