@@ -4,7 +4,7 @@ use clap_num::maybe_hex;
 use exhume_artefacts::parsers::build_registry;
 use exhume_artefacts::run_parser_by_name;
 use exhume_artefacts::{ObjectParsed, core::ParserInput};
-use exhume_body::Body;
+use exhume_body::credentials;
 use exhume_filesystem::Filesystem;
 use exhume_filesystem::detected_fs::detect_filesystem;
 use exhume_filesystem::filesystem::{FileCommon, FsFileReadSeek};
@@ -20,7 +20,7 @@ use log::{LevelFilter, error};
 /// - Emits parsed objects as JSON Lines (JSONL) to stdout.
 fn main() -> anyhow::Result<()> {
     // Define and parse command‑line arguments.
-    let matches = Command::new("parse_from_fs")
+    let command = Command::new("parse_from_fs")
         .about("Parse a file (by filesystem record ID) inside a disk image and output JSONL.")
         .arg(
             Arg::new("list_parsers")
@@ -80,8 +80,8 @@ fn main() -> anyhow::Result<()> {
                 .long("log-level")
                 .value_parser(["error", "warn", "info", "debug", "trace"])
                 .default_value("info"),
-        )
-        .get_matches();
+        );
+    let matches = password_args(command).get_matches();
 
     // Configure and initialize the logger based on the requested log level.
     let log_level_str = matches.get_one::<String>("log_level").unwrap();
@@ -122,7 +122,15 @@ fn main() -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("unknown parser: {parser_name}"))?;
 
     // Open the disk image / body and detect the filesystem within the given region.
-    let body = Body::new(body_path.to_owned(), format);
+    let body = credentials::open_body(
+        body_path,
+        format,
+        matches
+            .get_one::<String>("password_file")
+            .map(String::as_str),
+        matches.get_flag("password_stdin"),
+    )
+    .map_err(anyhow::Error::msg)?;
     let partition_size_bytes = fs_size_sectors * body.get_sector_size() as u64;
 
     let mut fs = detect_filesystem(&body, fs_offset, partition_size_bytes, None)
@@ -165,4 +173,24 @@ fn main() -> anyhow::Result<()> {
     .with_context(|| format!("parser '{parser_name}' failed"))?;
 
     Ok(())
+}
+
+/// Register this executable's mutually exclusive container-password sources.
+fn password_args(command: clap::Command) -> clap::Command {
+    command
+        .arg(
+            clap::Arg::new("password_file")
+                .long("password-file")
+                .global(true)
+                .value_name("PATH")
+                .conflicts_with("password_stdin")
+                .help("Read the image container password from a file; remove one trailing line ending."),
+        )
+        .arg(
+            clap::Arg::new("password_stdin")
+                .long("password-stdin")
+                .global(true)
+                .action(clap::ArgAction::SetTrue)
+                .help("Read the image container password from stdin; remove one trailing line ending."),
+        )
 }

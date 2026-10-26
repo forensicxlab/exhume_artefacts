@@ -2,6 +2,21 @@ use anyhow::Result;
 
 use super::{CompanionSpec, ObjectParsed, ParserInput, TimelineEvent};
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ParserIssueCode {
+    ChunkRead,
+    ChunkParse,
+    RecordParse,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ParserIssue {
+    pub code: ParserIssueCode,
+    pub unit: Option<u64>,
+    pub message: String,
+}
+
 /// A trait representing a generic parser that can process input into parsed objects.
 ///
 /// Implementors of this trait must be `Send` and `Sync` so they can be safely
@@ -61,4 +76,15 @@ pub trait Parser: Send + Sync {
         input: ParserInput,
         sink: &mut dyn FnMut(ObjectParsed) -> Result<()>,
     ) -> Result<()>;
+
+    /// Report recoverable parsing gaps without turning them into artefacts.
+    /// Existing parsers retain their current behavior through this default.
+    fn run_into_with_diagnostics(
+        &self,
+        input: ParserInput,
+        sink: &mut dyn FnMut(ObjectParsed) -> Result<()>,
+        _diagnostic: &mut dyn FnMut(ParserIssue) -> Result<()>,
+    ) -> Result<()> {
+        self.run_into(input, sink)
+    }
 }
