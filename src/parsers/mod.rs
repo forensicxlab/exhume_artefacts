@@ -1,3 +1,4 @@
+pub mod desktop;
 pub mod evtx;
 pub mod macos;
 pub mod mobile;
@@ -24,6 +25,11 @@ pub fn build_registry() -> ParserRegistry {
     m.insert(
         "windows_pml",
         Arc::new(pml::WindowsPmlParser) as Arc<dyn Parser>,
+    );
+
+    m.insert(
+        "desktop_signal",
+        Arc::new(desktop::SignalDesktopParser) as Arc<dyn Parser>,
     );
 
     m.insert(
