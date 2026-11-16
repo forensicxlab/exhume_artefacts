@@ -1,11 +1,12 @@
 //! Signal Desktop `db.sqlite` chat parser.
 //!
 //! Signal Desktop keeps its conversations in a SQLCipher-encrypted
-//! `sql/db.sqlite`. This parser works on the **decrypted** SQLite database: how
-//! the SQLCipher key is recovered (from `config.json` plus the OS keystore —
-//! DPAPI on Windows, GNOME Keyring or KWallet on Linux) is a separate concern
-//! handled before the bytes reach a parser, so this module takes an ordinary
-//! `db.sqlite` and never touches secrets.
+//! `sql/db.sqlite`. This parser reads that file directly when the caller
+//! supplies the raw database key (the `database_key` secret option, opened
+//! through [`crate::formats::sqlite::sqlcipher`]), and it reads an already
+//! decrypted copy as an ordinary SQLite database. It performs no key recovery:
+//! obtaining the key from `config.json` and the operating system's keystore is
+//! specific to each OS and stays outside the shared database interpretation.
 //!
 //! The format is the same on every operating system: a `conversations` table
 //! and a `messages` table, each with promoted columns plus a `json` blob that
@@ -23,11 +24,18 @@
 use crate::core::records::{
     AppInfo, Attachment, ChatMessage, Conversation, Direction, MessageState, Party,
 };
-use crate::core::{CompanionSpec, ObjectParsed, Parser, ParserInput, TimelineEvent};
-use crate::formats::sqlite::{SqliteConnection, SqliteEvidence, SqliteSchema, select_column};
+use crate::core::{
+    CompanionSpec, ObjectParsed, Parser, ParserContext, ParserInput, ParserInputError, ParserIssue,
+    ParserOptionDefault, ParserOptionSpec, ParserOptionType, ParserOptionValue, ParserOptions,
+    TimelineEvent,
+};
+use crate::formats::sqlite::sqlcipher::{SqlCipherError, SqlCipherKey, SqlCipherProfile};
+use crate::formats::sqlite::{
+    SqliteConnection, SqliteEvidence, SqliteSchema, select_column, sqlite_source_json,
+};
 use crate::formats::timestamps::unix_millis_to_json;
 use anyhow::Result;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use std::collections::{BTreeMap, HashMap};
 
 const PARSER_NAME: &str = "desktop_signal";
@@ -76,6 +84,33 @@ const ROOT_EDIT_HISTORY_INDEX: i64 = -1;
 const SQLITE_COMPANIONS: &[CompanionSpec] = &[
     CompanionSpec::optional_suffix("sqlite_wal", "-wal"),
     CompanionSpec::optional_suffix("sqlite_shm", "-shm"),
+];
+
+const DATABASE_KEY: &str = "database_key";
+const CIPHER_VERSION: &str = "cipher_version";
+
+/// Same names and meaning as the SQLCipher inspection example, so a key that
+/// passes there is passed here unchanged.
+const OPTIONS: &[ParserOptionSpec] = &[
+    ParserOptionSpec {
+        name: DATABASE_KEY,
+        label: "Database key",
+        description: "Raw SQLCipher database key: exactly 64 hexadecimal characters. \
+                      Only needed when db.sqlite is still encrypted",
+        value_type: ParserOptionType::Secret,
+        // Conditional: requested at run time, and only for an encrypted input.
+        required: false,
+        default: None,
+    },
+    ParserOptionSpec {
+        name: CIPHER_VERSION,
+        label: "SQLCipher compatibility version",
+        description: "Standard SQLCipher settings: 4 (current Signal Desktop) or 3 \
+                      (database never opened by a release using SQLCipher 4)",
+        value_type: ParserOptionType::Integer,
+        required: false,
+        default: Some(ParserOptionDefault::Integer(4)),
+    },
 ];
 
 /// A conversation, as the parser needs it while normalising messages.
@@ -137,20 +172,85 @@ impl Directory {
     }
 }
 
+/// Columns of `message_attachments` reported verbatim, beside the ones the
+/// parser interprets: `(column, key in the output)`.
+const ATTACHMENT_TEXT_COLUMNS: &[(&str, &str)] = &[
+    ("clientUuid", "client_uuid"),
+    ("blurHash", "blur_hash"),
+    ("digest", "digest"),
+    ("key", "key"),
+    ("incrementalMac", "incremental_mac"),
+    ("downloadPath", "download_path"),
+    ("localBackupPath", "local_backup_path"),
+    ("transitCdnKey", "transit_cdn_key"),
+    ("thumbnailContentType", "thumbnail_content_type"),
+    ("thumbnailLocalKey", "thumbnail_local_key"),
+    ("screenshotPath", "screenshot_path"),
+    ("screenshotContentType", "screenshot_content_type"),
+    ("screenshotLocalKey", "screenshot_local_key"),
+    ("backupThumbnailPath", "backup_thumbnail_path"),
+    (
+        "backupThumbnailContentType",
+        "backup_thumbnail_content_type",
+    ),
+    ("backupThumbnailLocalKey", "backup_thumbnail_local_key"),
+    ("storyTextAttachmentJson", "story_text_attachment_json"),
+];
+const ATTACHMENT_INTEGER_COLUMNS: &[(&str, &str)] = &[
+    ("version", "version"),
+    ("incrementalMacChunkSize", "incremental_mac_chunk_size"),
+    ("transitCdnNumber", "transit_cdn_number"),
+    ("transitCdnUploadTimestamp", "transit_cdn_upload_timestamp"),
+    ("backupCdnNumber", "backup_cdn_number"),
+    ("thumbnailSize", "thumbnail_size"),
+    ("thumbnailVersion", "thumbnail_version"),
+    ("screenshotSize", "screenshot_size"),
+    ("screenshotVersion", "screenshot_version"),
+    ("backupThumbnailSize", "backup_thumbnail_size"),
+    ("backupThumbnailVersion", "backup_thumbnail_version"),
+    ("flags", "flags"),
+    ("error", "error"),
+    ("wasTooBig", "was_too_big"),
+    ("isCorrupted", "is_corrupted"),
+    (
+        "copiedFromQuotedAttachment",
+        "copied_from_quoted_attachment",
+    ),
+    ("pending", "pending"),
+    ("backfillError", "backfill_error"),
+    ("isViewOnce", "is_view_once"),
+    ("transcodingTargetQuality", "transcoding_target_quality"),
+];
+
+/// Directory of the Signal profile that `path` and `thumbnailPath` are
+/// relative to. The database itself sits in the sibling `sql` directory.
+const ATTACHMENTS_DIRECTORY: &str = "attachments.noindex";
+
 /// One attachment row, whichever generation of the schema stored it.
 struct SignalAttachment {
+    /// Row in `message_attachments`; none for an attachment kept in the
+    /// message `json`.
+    rowid: Option<i64>,
     /// `attachment`, `long-message`, `quote`, `preview`, `contact` or `sticker`.
     attachment_type: String,
     order: Option<i64>,
     content_type: Option<String>,
     file_name: Option<String>,
-    /// Relative to the profile's `attachments.noindex` directory.
+    /// As recorded: relative to the profile's `attachments.noindex` directory.
     path: Option<String>,
     size: Option<i64>,
     /// Key Signal encrypts the file on disk with (base64), when it does.
     local_key: Option<String>,
     plaintext_hash: Option<String>,
     caption: Option<String>,
+    width: Option<i64>,
+    height: Option<i64>,
+    /// Seconds, for audio and video.
+    duration: Option<f64>,
+    thumbnail_path: Option<String>,
+    /// What else the database records about it, as stored: the other columns
+    /// that hold a value, or the whole entry of the message `json`.
+    recorded: Vec<(&'static str, Value)>,
 }
 
 impl SignalAttachment {
@@ -168,18 +268,83 @@ impl SignalAttachment {
     }
 
     fn to_details(&self) -> Value {
-        json!({
-            "attachment_type": self.attachment_type,
-            "order_in_message": self.order,
-            "content_type": self.content_type,
-            "file_name": self.file_name,
-            "path": self.path,
-            "size": self.size,
-            "local_key": self.local_key,
-            "plaintext_hash": self.plaintext_hash,
-            "caption": self.caption,
-        })
+        let mut details = Map::new();
+        for (key, value) in [
+            ("rowid", json!(self.rowid)),
+            ("attachment_type", json!(self.attachment_type)),
+            ("order_in_message", json!(self.order)),
+            ("content_type", json!(self.content_type)),
+            ("file_name", json!(self.file_name)),
+            ("path", json!(self.path)),
+            ("size", json!(self.size)),
+            ("local_key", json!(self.local_key)),
+            ("plaintext_hash", json!(self.plaintext_hash)),
+            ("caption", json!(self.caption)),
+            ("width", json!(self.width)),
+            ("height", json!(self.height)),
+            ("duration", json!(self.duration)),
+            ("thumbnail_path", json!(self.thumbnail_path)),
+        ] {
+            details.insert(key.to_owned(), value);
+        }
+        for (key, value) in &self.recorded {
+            details.insert((*key).to_owned(), value.clone());
+        }
+        Value::Object(details)
     }
+
+    /// Whether the row is a file of the message itself. Quote thumbnails, link
+    /// previews, shared-contact avatars and the overflow of a long text are
+    /// attachment rows too, but belong to the message content.
+    fn is_message_file(&self) -> bool {
+        matches!(self.attachment_type.as_str(), "attachment" | "sticker")
+    }
+
+    /// Text shown and searched for the attachment record.
+    fn label(&self) -> String {
+        [&self.file_name, &self.caption, &self.path]
+            .into_iter()
+            .find_map(|value| non_empty(value.clone()))
+            .unwrap_or_else(|| attachment_kind(&self.attachment_type, self.content_type.as_deref()))
+    }
+}
+
+/// The opened evidence copy and how it was opened.
+struct Store<'a> {
+    evidence: &'a SqliteEvidence,
+    /// The SQLCipher settings the database was opened with; none for a
+    /// database that was already decrypted.
+    cipher: Option<SqlCipherProfile>,
+}
+
+impl Store<'_> {
+    fn source(&self, table: &str, id: Option<&str>, rowid: Option<i64>) -> Value {
+        let mut source = sqlite_source_json(
+            self.evidence,
+            table,
+            rowid.unwrap_or_default(),
+            SCHEMA_VARIANT,
+        );
+        source["id"] = json!(id);
+        source["rowid"] = json!(rowid);
+        source["cipher_profile"] = json!(self.cipher);
+        source
+    }
+}
+
+/// What an attachment record repeats about the message it belongs to.
+struct MessageContext<'a> {
+    rowid: Option<i64>,
+    id: Option<&'a str>,
+    signal_type: &'a str,
+    content_kind: &'a str,
+    body: Option<&'a str>,
+    direction: Direction,
+    sender: &'a Party,
+    conversation_id: &'a str,
+    conversation: &'a ConvInfo,
+    sent_at: Option<i64>,
+    received_at: Option<i64>,
 }
 
 /// Map a Signal attachment onto the envelope's `image | video | audio |
@@ -208,7 +373,12 @@ impl Parser for SignalDesktopParser {
     }
 
     fn description(&self) -> &'static str {
-        "Parse a decrypted Signal Desktop db.sqlite: conversations, messages, attachments, reactions."
+        "Parse a Signal Desktop db.sqlite (decrypted, or SQLCipher with its database key): \
+         conversations, messages, attachments, reactions."
+    }
+
+    fn option_specs(&self) -> &'static [ParserOptionSpec] {
+        OPTIONS
     }
 
     fn companion_specs(&self) -> &'static [CompanionSpec] {
@@ -216,37 +386,51 @@ impl Parser for SignalDesktopParser {
     }
 
     fn extract_timeline_events(&self, obj: &ObjectParsed) -> Vec<TimelineEvent> {
-        if obj.kind != "mobile.communication.message" {
-            return Vec::new();
-        }
+        let event_type = match obj.kind {
+            "mobile.communication.message" => "mobile.communication.message",
+            "mobile.communication.attachment" => "mobile.communication.attachment",
+            _ => return Vec::new(),
+        };
         let Some(ts_unix_ms) = obj.json["timestamps"]["message"]["unix_ms"].as_i64() else {
             return Vec::new();
         };
-        // `text` is the body, or the attachment name for a media-only message.
+        // `text` is the body, or the attachment name for a media-only message
+        // and for an attachment record.
         let description = Some(obj.text.clone()).filter(|text| !text.is_empty());
         let actor = obj.json["sender"]["id"].as_str().map(str::to_owned);
         vec![TimelineEvent {
             ts_unix_ms,
-            event_type: "mobile.communication.message",
+            event_type,
             description,
             actor,
         }]
     }
 
+    /// Without options a decrypted database is parsed as is, and an encrypted
+    /// one answers with a request for `database_key`.
     fn run_into(
         &self,
         input: ParserInput,
         sink: &mut dyn FnMut(ObjectParsed) -> Result<()>,
     ) -> Result<()> {
-        let evidence = SqliteEvidence::from_input(input, "db.sqlite")?;
-        if !has_sqlite_header(evidence.path()) {
-            anyhow::bail!(
-                "{} is not a plain SQLite database; a Signal Desktop db.sqlite is \
-                 SQLCipher-encrypted and must be decrypted before it is parsed",
-                evidence.source_label()
-            );
+        crate::run_parser_with_options(self, input, ParserOptions::default(), sink, &mut |_| Ok(()))
+    }
+
+    fn run_into_with_context(
+        &self,
+        input: ParserInput,
+        context: &ParserContext,
+        sink: &mut dyn FnMut(ObjectParsed) -> Result<()>,
+        _diagnostic: &mut dyn FnMut(ParserIssue) -> Result<()>,
+    ) -> Result<()> {
+        if context.parser_name() != PARSER_NAME {
+            return Err(ParserInputError::invalid("context", "parser context mismatch").into());
         }
-        let conn = SqliteConnection::open(evidence.path())?;
+        let profile = cipher_profile(context)?;
+        let evidence = SqliteEvidence::from_input(input, "db.sqlite")?;
+        // Everything that can ask for input or refuse the database happens
+        // here, before the first record, so the caller can retry safely.
+        let (conn, cipher) = open_database(&evidence, context, profile)?;
         let schema = conn.schema()?;
 
         let missing: Vec<&str> = ["conversations", "messages"]
@@ -255,7 +439,7 @@ impl Parser for SignalDesktopParser {
             .collect();
         if !missing.is_empty() {
             anyhow::bail!(
-                "not a decrypted Signal Desktop database: missing table(s) {}",
+                "not a Signal Desktop database: missing table(s) {}",
                 missing.join(", ")
             );
         }
@@ -273,12 +457,16 @@ impl Parser for SignalDesktopParser {
         let directory = load_directory(&conn, &schema)?;
         let attachments = load_table_attachments(&conn, &schema)?;
         let edits = load_edit_read_status(&conn, &schema)?;
+        let store = Store {
+            evidence: &evidence,
+            cipher,
+        };
 
-        emit_conversations(&directory, &evidence, sink)?;
+        emit_conversations(&directory, &store, sink)?;
         emit_messages(
             &conn,
             &schema,
-            &evidence,
+            &store,
             &directory,
             &attachments,
             &edits,
@@ -287,14 +475,75 @@ impl Parser for SignalDesktopParser {
     }
 }
 
+fn cipher_profile(context: &ParserContext) -> Result<SqlCipherProfile, ParserInputError> {
+    match context.option(CIPHER_VERSION) {
+        Some(ParserOptionValue::Integer(3)) => Ok(SqlCipherProfile::SqlCipher3),
+        Some(ParserOptionValue::Integer(4)) => Ok(SqlCipherProfile::SqlCipher4),
+        _ => Err(ParserInputError::invalid(CIPHER_VERSION, "expected 3 or 4")),
+    }
+}
+
+/// Open the evidence copy as plain SQLite when it starts with the SQLite
+/// header, and through SQLCipher with the caller's key otherwise.
+///
+/// A file without that header is not known to be encrypted: it may also be
+/// damaged or not a database. The key request says what would be needed if it
+/// is, and a failed open keeps the backend's own error, which does not single
+/// out the key: the cipher settings or the evidence can be responsible too.
+fn open_database(
+    evidence: &SqliteEvidence,
+    context: &ParserContext,
+    profile: SqlCipherProfile,
+) -> Result<(SqliteConnection, Option<SqlCipherProfile>)> {
+    match leading_bytes(evidence.path())? {
+        Leading::SqliteHeader => {
+            if context.secret(DATABASE_KEY).is_some() {
+                log::debug!(
+                    "{}: plain SQLite database, {DATABASE_KEY} not used",
+                    evidence.source_label()
+                );
+            }
+            Ok((SqliteConnection::open(evidence.path())?, None))
+        }
+        Leading::Nothing => anyhow::bail!("{} is empty", evidence.source_label()),
+        Leading::Other => {
+            // A key cannot help a build that has no SQLCipher backend.
+            if !cfg!(feature = "sqlcipher") {
+                return Err(
+                    anyhow::Error::new(SqlCipherError::Unavailable).context(format!(
+                        "{} does not start with the SQLite header and is probably still encrypted",
+                        evidence.source_label()
+                    )),
+                );
+            }
+            let key = SqlCipherKey::from_hex(context.require_secret(DATABASE_KEY)?)
+                .map_err(|error| ParserInputError::invalid(DATABASE_KEY, error.to_string()))?;
+            let conn = SqliteConnection::open_encrypted(evidence.path(), &key, profile)?;
+            Ok((conn, Some(profile)))
+        }
+    }
+}
+
+enum Leading {
+    SqliteHeader,
+    Nothing,
+    Other,
+}
+
 /// SQLCipher encrypts the whole first page, so an encrypted database does not
 /// start with the SQLite magic.
-fn has_sqlite_header(path: &std::path::Path) -> bool {
+fn leading_bytes(path: &std::path::Path) -> Result<Leading> {
     use std::io::Read;
-    let mut magic = [0u8; 16];
-    std::fs::File::open(path)
-        .and_then(|mut file| file.read_exact(&mut magic))
-        .is_ok_and(|()| &magic == b"SQLite format 3\0")
+    const MAGIC: &[u8; 16] = b"SQLite format 3\0";
+    let mut start = Vec::with_capacity(MAGIC.len());
+    std::fs::File::open(path)?
+        .take(MAGIC.len() as u64)
+        .read_to_end(&mut start)?;
+    Ok(match start.as_slice() {
+        [] => Leading::Nothing,
+        start if start == MAGIC => Leading::SqliteHeader,
+        _ => Leading::Other,
+    })
 }
 
 /// `items` row `uuid_id` carries the device owner's service id (ACI), stored
@@ -467,37 +716,77 @@ fn load_table_attachments(
     } else {
         String::new()
     };
+    // Interpreted columns first, then the ones reported verbatim.
+    const INTERPRETED: &[&str] = &[
+        "attachmentType",
+        "orderInMessage",
+        "contentType",
+        "fileName",
+        "path",
+        "size",
+        "localKey",
+        "plaintextHash",
+        "caption",
+        "width",
+        "height",
+        "duration",
+        "thumbnailPath",
+    ];
+    const FIRST_VERBATIM: usize = 2 + INTERPRETED.len();
+    let verbatim = ATTACHMENT_TEXT_COLUMNS
+        .iter()
+        .chain(ATTACHMENT_INTEGER_COLUMNS)
+        .map(|(column, _)| column);
+    let columns: Vec<String> = INTERPRETED
+        .iter()
+        .chain(verbatim)
+        .enumerate()
+        .map(|(index, column)| select_column(schema, TABLE, "a", column, &format!("c{index}")))
+        .collect();
     let sql = format!(
-        "SELECT a.messageId AS message_id, {}, {}, {}, {}, {}, {}, {}, {}, {} \
+        "SELECT a.messageId AS message_id, a.rowid AS row_id, {} \
          FROM {TABLE} a {revision_filter} ORDER BY a.rowid;",
-        select_column(schema, TABLE, "a", "attachmentType", "attachment_type"),
-        select_column(schema, TABLE, "a", "orderInMessage", "order_in_message"),
-        select_column(schema, TABLE, "a", "contentType", "content_type"),
-        select_column(schema, TABLE, "a", "fileName", "file_name"),
-        select_column(schema, TABLE, "a", "path", "path"),
-        select_column(schema, TABLE, "a", "size", "size"),
-        select_column(schema, TABLE, "a", "localKey", "local_key"),
-        select_column(schema, TABLE, "a", "plaintextHash", "plaintext_hash"),
-        select_column(schema, TABLE, "a", "caption", "caption"),
+        columns.join(", "),
     );
 
     conn.query_rows(&sql, |row| {
         let Some(message_id) = row.text(0) else {
             return Ok(());
         };
+        // Most of these columns are empty on most rows; keep what is set.
+        let mut recorded = Vec::new();
+        let mut index = FIRST_VERBATIM as i32;
+        for (_, key) in ATTACHMENT_TEXT_COLUMNS {
+            if let Some(value) = row.text(index) {
+                recorded.push((*key, Value::String(value)));
+            }
+            index += 1;
+        }
+        for (_, key) in ATTACHMENT_INTEGER_COLUMNS {
+            if let Some(value) = row.i64(index) {
+                recorded.push((*key, json!(value)));
+            }
+            index += 1;
+        }
         by_message
             .entry(message_id)
             .or_default()
             .push(SignalAttachment {
-                attachment_type: row.text(1).unwrap_or_else(|| "attachment".to_owned()),
-                order: row.i64(2),
-                content_type: row.text(3),
-                file_name: row.text(4),
-                path: row.text(5),
-                size: row.i64(6),
-                local_key: row.text(7),
-                plaintext_hash: row.text(8),
-                caption: row.text(9),
+                rowid: row.i64(1),
+                attachment_type: row.text(2).unwrap_or_else(|| "attachment".to_owned()),
+                order: row.i64(3),
+                content_type: row.text(4),
+                file_name: row.text(5),
+                path: row.text(6),
+                size: row.i64(7),
+                local_key: row.text(8),
+                plaintext_hash: row.text(9),
+                caption: row.text(10),
+                width: row.i64(11),
+                height: row.i64(12),
+                duration: row.f64(13),
+                thumbnail_path: row.text(14),
+                recorded,
             });
         Ok(())
     })?;
@@ -514,6 +803,7 @@ fn json_attachments(blob: &Value) -> Vec<SignalAttachment> {
     let from_json = |attachment_type: &str, order: usize, item: &Value| {
         let text_of = |key: &str| item[key].as_str().map(str::to_owned);
         SignalAttachment {
+            rowid: None,
             attachment_type: attachment_type.to_owned(),
             order: i64::try_from(order).ok(),
             content_type: text_of("contentType"),
@@ -523,6 +813,12 @@ fn json_attachments(blob: &Value) -> Vec<SignalAttachment> {
             local_key: text_of("localKey"),
             plaintext_hash: text_of("plaintextHash"),
             caption: text_of("caption"),
+            width: item["width"].as_i64(),
+            height: item["height"].as_i64(),
+            duration: item["duration"].as_f64(),
+            thumbnail_path: item["thumbnail"]["path"].as_str().map(str::to_owned),
+            // No columns here: the entry is the record.
+            recorded: vec![("inline_json", item.clone())],
         }
     };
     let mut attachments: Vec<SignalAttachment> = blob["attachments"]
@@ -544,7 +840,7 @@ fn json_attachments(blob: &Value) -> Vec<SignalAttachment> {
 
 fn emit_conversations(
     directory: &Directory,
-    evidence: &SqliteEvidence,
+    store: &Store,
     sink: &mut dyn FnMut(ObjectParsed) -> Result<()>,
 ) -> Result<()> {
     for (id, conv) in &directory.conversations {
@@ -552,7 +848,7 @@ fn emit_conversations(
             "platform": PLATFORM,
             "app": APP_LABEL,
             "record_type": "chat",
-            "source": source_json(evidence, "conversations", Some(id), conv.rowid),
+            "source": store.source("conversations", Some(id), conv.rowid),
             "chat": {
                 "id": id,
                 "name": conv.name,
@@ -588,7 +884,7 @@ fn emit_conversations(
 fn emit_messages(
     conn: &SqliteConnection,
     schema: &SqliteSchema,
-    evidence: &SqliteEvidence,
+    store: &Store,
     directory: &Directory,
     table_attachments: &HashMap<String, Vec<SignalAttachment>>,
     edits: &EditReadStatus,
@@ -733,6 +1029,27 @@ fn emit_messages(
         let is_view_once = row.bool(15).or_else(|| blob["isViewOnce"].as_bool());
         let content_kind = content_kind(&blob, flags, is_erased, is_view_once, &body, attachments);
 
+        // One record per file of the message, next to the inline list: the
+        // indexer resolves and links attachments from these.
+        let context = MessageContext {
+            rowid,
+            id: message_id.as_deref(),
+            signal_type: &message_type,
+            content_kind,
+            body: body.as_deref(),
+            direction,
+            sender: &sender,
+            conversation_id: &conversation_id,
+            conversation: conv,
+            sent_at,
+            received_at,
+        };
+        let attachment_records: Vec<ObjectParsed> = attachments
+            .iter()
+            .filter(|attachment| attachment.is_message_file())
+            .map(|attachment| attachment_record(store, attachment, &context))
+            .collect();
+
         let message = ChatMessage {
             parser: PARSER_NAME,
             platform: PLATFORM,
@@ -750,16 +1067,11 @@ fn emit_messages(
             body,
             attachments: attachments
                 .iter()
-                .filter(|attachment| {
-                    matches!(
-                        attachment.attachment_type.as_str(),
-                        "attachment" | "sticker"
-                    )
-                })
+                .filter(|attachment| attachment.is_message_file())
                 .map(SignalAttachment::to_canonical)
                 .collect(),
             state,
-            source: source_json(evidence, T, message_id.as_deref(), rowid),
+            source: store.source(T, message_id.as_deref(), rowid),
             details: json!({
                 "message": {
                     "signal_type": message_type,
@@ -814,8 +1126,85 @@ fn emit_messages(
         {
             object.text = text;
         }
-        sink(object)
+        sink(object)?;
+        attachment_records.into_iter().try_for_each(&mut *sink)
     })
+}
+
+/// A `mobile.communication.attachment` record, in the shape the WhatsApp and
+/// iMessage parsers emit: `message.rowid` and `chat.rowid` link it to its
+/// message, `media` and `attachment` carry what the attachment view reads, and
+/// `details` keeps everything the database records about the file, including
+/// the key it is encrypted with on disk.
+fn attachment_record(
+    store: &Store,
+    attachment: &SignalAttachment,
+    message: &MessageContext,
+) -> ObjectParsed {
+    // A row of the table, or the message row that holds the inline entry.
+    let source = match attachment.rowid {
+        Some(rowid) => store.source("message_attachments", message.id, Some(rowid)),
+        None => store.source("messages", message.id, message.rowid),
+    };
+    let conversation = message.conversation;
+    let json = json!({
+        "platform": PLATFORM,
+        "app": APP_LABEL,
+        "record_type": "attachment",
+        "source": source,
+        "timestamps": {
+            "message": unix_millis_to_json(message.sent_at),
+            "sent": unix_millis_to_json(message.sent_at),
+            "received": unix_millis_to_json(message.received_at),
+        },
+        "direction": message.direction.as_str(),
+        "message": {
+            "rowid": message.rowid,
+            "id": message.id,
+            "text": message.body,
+            "signal_type": message.signal_type,
+            "content_kind": message.content_kind,
+        },
+        "chat": {
+            "rowid": conversation.rowid,
+            "id": message.conversation_id,
+            "name": conversation.name,
+            "type": conversation.conv_type,
+            "group_id": conversation.group_id,
+        },
+        "sender": message.sender.to_json(),
+        "media": {
+            "rowid": attachment.rowid,
+            "local_path": attachment.path,
+            "thumbnail_local_path": attachment.thumbnail_path,
+            "title": attachment.caption,
+            "file_size": attachment.size,
+            "width": attachment.width,
+            "height": attachment.height,
+            "movie_duration": attachment.duration,
+        },
+        "attachment": {
+            "kind": attachment_kind(
+                &attachment.attachment_type,
+                attachment.content_type.as_deref(),
+            ),
+            "mime": attachment.content_type,
+            "file_name": attachment.file_name,
+            "local_path": attachment.path,
+            // Both paths are relative to this directory of the profile.
+            "local_path_base": ATTACHMENTS_DIRECTORY,
+            "thumbnail_path": attachment.thumbnail_path,
+            "caption": attachment.caption,
+            "has_local_key": attachment.local_key.is_some(),
+        },
+        "details": attachment.to_details(),
+    });
+    ObjectParsed {
+        parser: PARSER_NAME,
+        kind: "mobile.communication.attachment",
+        text: attachment.label(),
+        json,
+    }
 }
 
 /// What an `incoming` / `outgoing` row carries. Signal stores stickers, polls,
@@ -882,14 +1271,16 @@ fn structured_text(blob: &Value) -> Option<String> {
 /// `(delivered, read)` of an outgoing message, from a per-recipient
 /// `sendStateByConversationId` map.
 ///
-/// * delivered: true once a recipient reports `Delivered`, `Read` or `Viewed`,
-///   false otherwise (delivery receipts cannot be switched off);
+/// * delivered: true once a recipient reports `Delivered`, `Read` or `Viewed`;
+///   false when the recorded state holds no such confirmation, which does not
+///   prove the message never arrived; unknown when no state is recorded;
 /// * read: true once a recipient reports `Read` or `Viewed`, and unknown
 ///   otherwise, because a recipient may have disabled read receipts.
 ///
 /// In a group this means "at least one member"; the complete map stays in
-/// `details`. The sender's own entry only tracks the sync to linked devices, so
-/// it is ignored unless it is the only one (Note to Self).
+/// `details`. The owner's own entry only tracks the sync to their linked
+/// devices, so it never counts for another recipient: it is read only when it
+/// is the sole entry (Note to Self).
 fn outgoing_state(states: &Value, own_conversation: Option<&str>) -> (Option<bool>, Option<bool>) {
     let Some(states) = states.as_object() else {
         return (None, None);
@@ -960,39 +1351,10 @@ fn parse_json(text: Option<String>) -> Value {
         .unwrap_or(Value::Null)
 }
 
-fn source_json(
-    evidence: &SqliteEvidence,
-    table: &str,
-    id: Option<&str>,
-    rowid: Option<i64>,
-) -> Value {
-    json!({
-        "path": evidence.source_label(),
-        "table": table,
-        "id": id,
-        "rowid": rowid,
-        "schema_variant": SCHEMA_VARIANT,
-        "parser_confidence": "compatible_schema",
-        "copied_sidecars": evidence.copied_sidecars(),
-        "files": evidence
-            .source_files()
-            .iter()
-            .map(|file| {
-                json!({
-                    "role": &file.role,
-                    "path": &file.path,
-                    "artifact_id": file.artifact_id,
-                    "system_file_id": file.system_file_id,
-                    "fs_identifier": file.fs_identifier,
-                })
-            })
-            .collect::<Vec<_>>(),
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::ParserSecret;
 
     const ME: &str = "aaaaaaaa-0000-4000-8000-000000000001";
     const ALICE: &str = "bbbbbbbb-0000-4000-8000-000000000002";
@@ -1010,6 +1372,46 @@ mod tests {
             Ok(())
         })?;
         Ok(objects)
+    }
+
+    fn options(key: Option<&[u8]>, cipher_version: Option<i64>) -> ParserOptions {
+        let mut options = ParserOptions::default();
+        if let Some(key) = key {
+            options
+                .insert_secret(DATABASE_KEY, ParserSecret::new(key.to_vec()))
+                .unwrap();
+        }
+        if let Some(version) = cipher_version {
+            options
+                .insert(CIPHER_VERSION, ParserOptionValue::Integer(version))
+                .unwrap();
+        }
+        options
+    }
+
+    /// Run with options; the count is what reached the sink, error or not.
+    fn run(input: ParserInput, options: ParserOptions) -> (Result<()>, Vec<ObjectParsed>) {
+        let mut objects = Vec::new();
+        let result = crate::run_parser_with_options(
+            &SignalDesktopParser,
+            input,
+            options,
+            &mut |object| {
+                objects.push(object);
+                Ok(())
+            },
+            &mut |_| Ok(()),
+        );
+        (result, objects)
+    }
+
+    /// What SQLCipher writes is indistinguishable from random bytes.
+    fn opaque_bytes() -> Vec<u8> {
+        (0..4096u32).map(|i| (i * 131 + 7) as u8).collect()
+    }
+
+    fn attachment_records(objects: &[ObjectParsed]) -> Vec<&ObjectParsed> {
+        of_kind(objects, "mobile.communication.attachment")
     }
 
     fn of_kind<'a>(objects: &'a [ObjectParsed], kind: &str) -> Vec<&'a ObjectParsed> {
@@ -1078,7 +1480,9 @@ mod tests {
                 editHistoryIndex INTEGER NOT NULL, attachmentType TEXT NOT NULL,
                 orderInMessage INTEGER NOT NULL, size INTEGER NOT NULL,
                 contentType TEXT NOT NULL, path TEXT, fileName TEXT, localKey TEXT,
-                plaintextHash TEXT, caption TEXT);
+                plaintextHash TEXT, caption TEXT, width INTEGER, height INTEGER,
+                duration REAL, thumbnailPath TEXT, thumbnailLocalKey TEXT, digest TEXT,
+                version INTEGER, transitCdnKey TEXT, transitCdnNumber INTEGER, pending INTEGER);
             CREATE TABLE edited_messages (messageId STRING, sentAt INTEGER,
                 readStatus INTEGER, conversationId STRING);
 
@@ -1097,12 +1501,19 @@ mod tests {
                 '{{"name":"Team","membersV2":[{{"aci":"{ME}"}},{{"aci":"{ALICE}"}},{{"aci":"{BOB}"}}]}}',
                 'group', 'Z3JvdXA=', {T0} + 9000);
 
-            INSERT INTO message_attachments VALUES
+            INSERT INTO message_attachments (messageId, editHistoryIndex, attachmentType,
+                orderInMessage, size, contentType, path, fileName, localKey, plaintextHash,
+                caption) VALUES
                 ('m3', -1, 'attachment', 1, 10, 'application/pdf', 'ab/second', 'b.pdf', NULL, NULL, NULL),
                 ('m3', -1, 'attachment', 0, 20, 'image/jpeg', 'ab/first', 'a.jpg', 'a2V5', 'hash', 'look'),
                 ('m3', -1, 'long-message', 0, 5000, 'text/x-signal-plain', 'ab/long', NULL, NULL, NULL, NULL),
                 ('m3', 0, 'attachment', 0, 20, 'image/png', 'ab/old-revision', 'old.png', NULL, NULL, NULL),
                 ('m10', -1, 'sticker', 0, 300, 'image/webp', 'st/1', NULL, NULL, NULL, NULL);
+            UPDATE message_attachments SET width = 640, height = 480,
+                thumbnailPath = 'ab/first-thumb', thumbnailLocalKey = 'dGh1bWI=',
+                digest = 'ZGlnZXN0', version = 2, transitCdnKey = 'cdn-key',
+                transitCdnNumber = 3, pending = 0 WHERE path = 'ab/first';
+            UPDATE message_attachments SET duration = 12.5 WHERE path = 'ab/second';
             INSERT INTO edited_messages VALUES ('m15', {T0} + 15500, 1, 'c-alice');
             "#
         );
@@ -1450,6 +1861,96 @@ mod tests {
         assert_eq!(m17["state"]["delivered"], true);
         assert_eq!(m17["state"]["read"], true);
 
+        // Each file of a message is also a record of its own, right after the
+        // message: two for m3 (not the long-message row, not the old
+        // revision), one for the sticker of m10.
+        let records = attachment_records(&objects);
+        assert_eq!(records.len(), 3);
+        let m3_at = objects
+            .iter()
+            .position(|object| object.json["source"]["id"] == "m3")
+            .unwrap();
+        assert_eq!(objects[m3_at].kind, "mobile.communication.message");
+        assert_eq!(objects[m3_at + 1].kind, "mobile.communication.attachment");
+        assert_eq!(objects[m3_at + 2].kind, "mobile.communication.attachment");
+        let first = &objects[m3_at + 1];
+        assert_eq!(first.text, "a.jpg");
+        assert_eq!(first.json["record_type"], "attachment");
+        assert_eq!(first.json["platform"], "desktop");
+        assert_eq!(first.json["app"], "signal");
+        assert_eq!(first.json["direction"], "incoming");
+        // The links the indexer follows.
+        assert_eq!(first.json["message"]["rowid"], 3);
+        assert_eq!(first.json["message"]["id"], "m3");
+        let alice_chat = chats
+            .iter()
+            .find(|chat| chat.json["chat"]["id"] == "c-alice")
+            .unwrap();
+        assert!(first.json["chat"]["rowid"].is_i64());
+        assert_eq!(
+            first.json["chat"]["rowid"],
+            alice_chat.json["source"]["rowid"]
+        );
+        assert_eq!(first.json["chat"]["id"], "c-alice");
+        assert_eq!(first.json["sender"]["id"], ALICE);
+        assert_eq!(first.json["timestamps"]["message"]["unix_ms"], T0 + 3000);
+        assert_eq!(first.json["source"]["table"], "message_attachments");
+        assert_eq!(first.json["source"]["id"], "m3");
+        assert!(first.json["media"]["rowid"].is_i64());
+        assert_eq!(first.json["source"]["rowid"], first.json["media"]["rowid"]);
+        // What the attachment view reads.
+        assert_eq!(first.json["attachment"]["kind"], "image");
+        assert_eq!(first.json["attachment"]["mime"], "image/jpeg");
+        assert_eq!(first.json["attachment"]["file_name"], "a.jpg");
+        assert_eq!(first.json["attachment"]["local_path"], "ab/first");
+        assert_eq!(
+            first.json["attachment"]["local_path_base"],
+            "attachments.noindex"
+        );
+        assert_eq!(first.json["attachment"]["caption"], "look");
+        assert_eq!(first.json["attachment"]["has_local_key"], true);
+        assert_eq!(first.json["media"]["local_path"], "ab/first");
+        assert_eq!(
+            first.json["media"]["thumbnail_local_path"],
+            "ab/first-thumb"
+        );
+        assert_eq!(first.json["media"]["file_size"], 20);
+        assert_eq!(first.json["media"]["width"], 640);
+        assert_eq!(first.json["media"]["height"], 480);
+        // The path, the key and the other columns stay as recorded.
+        let recorded = &first.json["details"];
+        assert_eq!(recorded["path"], "ab/first");
+        assert_eq!(recorded["local_key"], "a2V5");
+        assert_eq!(recorded["plaintext_hash"], "hash");
+        assert_eq!(recorded["thumbnail_local_key"], "dGh1bWI=");
+        assert_eq!(recorded["digest"], "ZGlnZXN0");
+        assert_eq!(recorded["version"], 2);
+        assert_eq!(recorded["transit_cdn_key"], "cdn-key");
+        assert_eq!(recorded["transit_cdn_number"], 3);
+        assert_eq!(recorded["pending"], 0);
+        // A column that holds nothing is not reported as a value.
+        assert!(recorded.get("screenshot_path").is_none());
+        // The same detail is in the message.
+        assert_eq!(m3["details"]["attachments"][0], *recorded);
+        let second = &objects[m3_at + 2];
+        assert_eq!(second.text, "b.pdf");
+        assert_eq!(second.json["attachment"]["kind"], "document");
+        assert_eq!(second.json["attachment"]["has_local_key"], false);
+        assert_eq!(second.json["media"]["movie_duration"], 12.5);
+        let sticker = records[2];
+        assert_eq!(sticker.json["message"]["id"], "m10");
+        assert_eq!(sticker.json["attachment"]["kind"], "sticker");
+        assert_eq!(sticker.json["message"]["content_kind"], "sticker");
+        // An attachment record is a timeline event too.
+        let events = SignalDesktopParser.extract_timeline_events(first);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "mobile.communication.attachment");
+        assert_eq!(events[0].ts_unix_ms, T0 + 3000);
+        assert_eq!(events[0].description.as_deref(), Some("a.jpg"));
+        assert_eq!(events[0].actor.as_deref(), Some(ALICE));
+        // A decrypted database is not reported as opened with a key.
+        assert!(m3["source"]["cipher_profile"].is_null());
+
         // One timeline event per message, described by its display text.
         let media_only = messages(&objects)[2];
         let events = SignalDesktopParser.extract_timeline_events(media_only);
@@ -1539,6 +2040,20 @@ mod tests {
         let m4 = message(&objects, "m4");
         assert_eq!(m4["attachments"][0]["kind"], "sticker");
         assert_eq!(m4["attachments"][0]["local_path"], "st/1");
+
+        // Inline attachments have no row of their own: the record points at
+        // the message row and keeps the entry of the message json.
+        let records = attachment_records(&objects);
+        assert_eq!(records.len(), 2);
+        let clip = &records[0].json;
+        assert_eq!(clip["message"]["id"], "m1");
+        assert_eq!(clip["attachment"]["kind"], "video");
+        assert_eq!(clip["attachment"]["local_path"], "cd/x");
+        assert!(clip["media"]["rowid"].is_null());
+        assert_eq!(clip["source"]["table"], "messages");
+        assert_eq!(clip["source"]["rowid"], clip["message"]["rowid"]);
+        assert_eq!(clip["details"]["inline_json"]["fileName"], "clip.mp4");
+        assert_eq!(records[1].json["attachment"]["kind"], "sticker");
         assert_eq!(m4["details"]["message"]["content_kind"], "sticker");
         Ok(())
     }
@@ -1625,13 +2140,210 @@ mod tests {
     }
 
     #[test]
-    fn reports_a_still_encrypted_database() {
-        // SQLCipher output is indistinguishable from random bytes.
-        let bytes: Vec<u8> = (0..4096u32).map(|i| (i * 131 + 7) as u8).collect();
-        let error = SignalDesktopParser
-            .run_into(ParserInput::Bytes(bytes), &mut |_| Ok(()))
-            .unwrap_err();
-        assert!(error.to_string().contains("must be decrypted"));
+    fn declares_the_shared_sqlcipher_options() {
+        ParserContext::validate_specs(SignalDesktopParser.option_specs()).unwrap();
+        let [key, version] = SignalDesktopParser.option_specs() else {
+            panic!("two options expected");
+        };
+        assert_eq!(key.name, "database_key");
+        assert_eq!(key.value_type, ParserOptionType::Secret);
+        assert!(!key.required);
+        assert_eq!(version.name, "cipher_version");
+        assert!(matches!(
+            version.default,
+            Some(ParserOptionDefault::Integer(4))
+        ));
+    }
+
+    #[test]
+    fn rejects_an_unknown_cipher_version_before_reading() {
+        let (result, objects) = run(ParserInput::Bytes(opaque_bytes()), options(None, Some(5)));
+        let error = result.unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<ParserInputError>(),
+            Some(ParserInputError::InvalidConfiguration { option, .. }) if option == "cipher_version"
+        ));
+        assert!(objects.is_empty());
+    }
+
+    #[test]
+    fn rejects_an_empty_file_without_asking_for_a_key() {
+        let (result, objects) = run(ParserInput::Bytes(Vec::new()), options(None, None));
+        let error = result.unwrap_err();
+        assert!(error.downcast_ref::<ParserInputError>().is_none());
+        assert!(error.to_string().ends_with("is empty"));
+        assert!(objects.is_empty());
+    }
+
+    /// A build without the backend says so at once: a key would not help.
+    #[cfg(not(feature = "sqlcipher"))]
+    #[test]
+    fn reports_a_missing_sqlcipher_backend() {
+        for options in [options(None, None), options(Some(&[b'0'; 64]), None)] {
+            let (result, objects) = run(ParserInput::Bytes(opaque_bytes()), options);
+            let error = result.unwrap_err();
+            assert_eq!(error.downcast_ref(), Some(&SqlCipherError::Unavailable));
+            assert!(error.downcast_ref::<ParserInputError>().is_none());
+            assert!(format!("{error:#}").contains("probably still encrypted"));
+            assert!(objects.is_empty());
+        }
+    }
+
+    #[cfg(feature = "sqlcipher")]
+    mod encrypted {
+        use super::*;
+        use crate::core::ParserInputReason;
+        use std::path::{Path, PathBuf};
+
+        const KEY: &[u8; 64] = b"00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        const OTHER_KEY: &[u8; 64] =
+            b"ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100";
+
+        /// The current schema, keyed the way Signal Desktop keys its database:
+        /// `PRAGMA key = "x'<64 hex>'"`, through the documented SQL interface.
+        fn encrypted_db(directory: &Path, compatibility: u8) -> Result<PathBuf> {
+            let db = directory.join("db.sqlite");
+            let conn = SqliteConnection::create_for_test(&db)?;
+            conn.execute_batch(&format!(
+                "PRAGMA key = \"x'{}'\"; PRAGMA cipher_compatibility = {compatibility};",
+                std::str::from_utf8(KEY)?
+            ))?;
+            conn.execute_batch(&current_schema())?;
+            drop(conn);
+            let bytes = std::fs::read(&db)?;
+            assert!(!bytes.starts_with(b"SQLite format 3"));
+            assert!(!bytes.windows(10).any(|window| window == b"unread one"));
+            Ok(db)
+        }
+
+        /// Everything but `source`, which names the file and how it was opened.
+        fn content(objects: &[ObjectParsed]) -> Vec<(&'static str, String, Value)> {
+            objects
+                .iter()
+                .map(|object| {
+                    let mut json = object.json.clone();
+                    json.as_object_mut().unwrap().remove("source");
+                    (object.kind, object.text.clone(), json)
+                })
+                .collect()
+        }
+
+        #[test]
+        fn asks_for_the_key_before_emitting_anything() -> Result<()> {
+            let tmp = tempfile::tempdir()?;
+            let db = encrypted_db(tmp.path(), 4)?;
+            for input in [ParserInput::Path(db), ParserInput::Bytes(opaque_bytes())] {
+                let (result, objects) = run(input, options(None, None));
+                let error = result.unwrap_err();
+                let Some(ParserInputError::NeedsInput { requests }) = error.downcast_ref() else {
+                    panic!("expected a request for input, got {error:#}");
+                };
+                assert_eq!(requests.len(), 1);
+                assert_eq!(requests[0].name, "database_key");
+                assert_eq!(requests[0].value_type, ParserOptionType::Secret);
+                assert_eq!(requests[0].reason, ParserInputReason::Missing);
+                assert!(objects.is_empty());
+            }
+            Ok(())
+        }
+
+        #[test]
+        fn reads_an_encrypted_database_like_its_decrypted_copy() -> Result<()> {
+            let tmp = tempfile::tempdir()?;
+            let db = encrypted_db(tmp.path(), 4)?;
+            let before = std::fs::read(&db)?;
+            let (result, objects) = run(ParserInput::Path(db.clone()), options(Some(KEY), None));
+            result?;
+            let plain = parse(&current_schema())?;
+            assert_eq!(content(&objects), content(&plain));
+            assert_eq!(messages(&objects).len(), 17);
+            assert_eq!(attachment_records(&objects).len(), 3);
+            // Every record says how its database was opened.
+            assert!(
+                objects
+                    .iter()
+                    .all(|object| object.json["source"]["cipher_profile"] == "4")
+            );
+            // The evidence is read from a working copy.
+            assert_eq!(std::fs::read(&db)?, before);
+            Ok(())
+        }
+
+        #[test]
+        fn opens_a_sqlcipher_3_database_when_told_so() -> Result<()> {
+            let tmp = tempfile::tempdir()?;
+            let db = encrypted_db(tmp.path(), 3)?;
+            let (result, objects) = run(ParserInput::Path(db.clone()), options(Some(KEY), None));
+            assert_eq!(
+                result.unwrap_err().downcast_ref(),
+                Some(&SqlCipherError::UnreadableDatabase)
+            );
+            assert!(objects.is_empty());
+            let (result, objects) = run(ParserInput::Path(db), options(Some(KEY), Some(3)));
+            result?;
+            assert_eq!(messages(&objects).len(), 17);
+            assert_eq!(objects[0].json["source"]["cipher_profile"], "3");
+            Ok(())
+        }
+
+        /// A failed open does not single out the key: the cipher settings or
+        /// the evidence may be responsible, so no "rejected" request is made.
+        #[test]
+        fn keeps_a_failed_open_undetermined() -> Result<()> {
+            let tmp = tempfile::tempdir()?;
+            let db = encrypted_db(tmp.path(), 4)?;
+            let mut damaged = std::fs::read(&db)?;
+            damaged[100..600].fill(0x5a);
+            for (input, key) in [
+                (ParserInput::Path(db), OTHER_KEY),
+                (ParserInput::Bytes(damaged), KEY),
+                (ParserInput::Bytes(opaque_bytes()), KEY),
+            ] {
+                let (result, objects) = run(input, options(Some(key), None));
+                let error = result.unwrap_err();
+                assert_eq!(
+                    error.downcast_ref(),
+                    Some(&SqlCipherError::UnreadableDatabase)
+                );
+                assert!(error.downcast_ref::<ParserInputError>().is_none());
+                let shown = format!("{error:#}");
+                assert!(shown.contains("key or cipher profile may be incorrect"));
+                assert!(!shown.contains(std::str::from_utf8(key)?));
+                assert!(objects.is_empty());
+            }
+            Ok(())
+        }
+
+        #[test]
+        fn refuses_a_malformed_key_without_echoing_it() -> Result<()> {
+            let tmp = tempfile::tempdir()?;
+            let db = encrypted_db(tmp.path(), 4)?;
+            let malformed = b"correct horse battery staple";
+            let (result, objects) = run(ParserInput::Path(db), options(Some(malformed), None));
+            let error = result.unwrap_err();
+            let Some(ParserInputError::InvalidConfiguration { option, message }) =
+                error.downcast_ref()
+            else {
+                panic!("expected an invalid option, got {error:#}");
+            };
+            assert_eq!(option, "database_key");
+            assert!(message.contains("64 hexadecimal characters"));
+            assert!(!format!("{error:#}").contains("horse"));
+            assert!(objects.is_empty());
+            Ok(())
+        }
+
+        #[test]
+        fn ignores_the_key_for_a_decrypted_database() -> Result<()> {
+            let tmp = tempfile::tempdir()?;
+            let db = tmp.path().join("db.sqlite");
+            SqliteConnection::create_for_test(&db)?.execute_batch(&current_schema())?;
+            let (result, objects) = run(ParserInput::Path(db), options(Some(KEY), None));
+            result?;
+            assert_eq!(messages(&objects).len(), 17);
+            assert!(objects[0].json["source"]["cipher_profile"].is_null());
+            Ok(())
+        }
     }
 
     #[test]
