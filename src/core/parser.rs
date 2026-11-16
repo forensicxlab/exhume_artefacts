@@ -1,6 +1,9 @@
 use anyhow::Result;
 
-use super::{CompanionSpec, ObjectParsed, ParserInput, TimelineEvent};
+use super::{
+    CompanionSpec, ObjectParsed, ParserContext, ParserInput, ParserInputError, ParserOptionSpec,
+    TimelineEvent,
+};
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -22,6 +25,31 @@ pub struct ParserIssue {
 /// Implementors of this trait must be `Send` and `Sync` so they can be safely
 /// shared and used across threads.
 pub trait Parser: Send + Sync {
+    /// Options accepted by this parser. Secret defaults are forbidden.
+    fn option_specs(&self) -> &'static [ParserOptionSpec] {
+        &[]
+    }
+
+    /// Context-aware entry point. Call `run_parser_with_options` to validate
+    /// user settings first. Existing implementations keep their diagnostics.
+    /// Parsers declaring settings must override this method to consume them.
+    fn run_into_with_context(
+        &self,
+        input: ParserInput,
+        context: &ParserContext,
+        sink: &mut dyn FnMut(ObjectParsed) -> Result<()>,
+        diagnostic: &mut dyn FnMut(ParserIssue) -> Result<()>,
+    ) -> Result<()> {
+        if context.parser_name() != self.name() || !context.is_empty() {
+            return Err(ParserInputError::invalid(
+                "context",
+                "parser does not support the supplied context",
+            )
+            .into());
+        }
+        self.run_into_with_diagnostics(input, sink, diagnostic)
+    }
+
     /// Returns the unique, static name of this parser implementation.
     fn name(&self) -> &'static str;
 

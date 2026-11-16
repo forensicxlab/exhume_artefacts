@@ -1,5 +1,7 @@
+pub mod cli;
 /// Core parsing traits, types, and shared functionality.
 pub mod core;
+pub mod input;
 /// Concrete parser implementations and the parser registry.
 pub mod parsers;
 
@@ -10,6 +12,39 @@ pub use core::{
     ParserFileProvider, ParserInfo, ParserInput, ParserIssue, ParserIssueCode, ParserSource,
     TimelineEvent,
 };
+pub use core::{
+    ParserContext, ParserInputError, ParserInputReason, ParserInputRequest, ParserOptionDefault,
+    ParserOptionSpec, ParserOptionType, ParserOptionValue, ParserOptions, ParserSecret,
+};
+
+/// Validate all settings before executing the parser. Downcast errors to
+/// `ParserInputError` to distinguish missing/rejected input from parse failures.
+pub fn run_parser_with_options(
+    parser: &dyn Parser,
+    input: ParserInput,
+    options: ParserOptions,
+    sink: &mut dyn FnMut(ObjectParsed) -> Result<()>,
+    diagnostic: &mut dyn FnMut(ParserIssue) -> Result<()>,
+) -> Result<()> {
+    let context = ParserContext::new(parser.name(), parser.option_specs(), options)?;
+    parser.run_into_with_context(input, &context, sink, diagnostic)
+}
+
+/// Look up a parser and execute it with validated per-invocation settings.
+/// Preserves output-sink, diagnostic and typed input-request errors.
+pub fn run_parser_by_name_with_options(
+    registry: &ParserRegistry,
+    name: &str,
+    input: ParserInput,
+    options: ParserOptions,
+    sink: &mut dyn FnMut(ObjectParsed) -> Result<()>,
+    diagnostic: &mut dyn FnMut(ParserIssue) -> Result<()>,
+) -> Result<()> {
+    let parser = registry
+        .get(name)
+        .ok_or_else(|| anyhow::anyhow!("unknown parser: {name}"))?;
+    run_parser_with_options(&**parser, input, options, sink, diagnostic)
+}
 
 /// Return a sorted list of metadata describing all registered parsers.
 ///
