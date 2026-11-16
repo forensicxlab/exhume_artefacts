@@ -12,6 +12,11 @@ license = "GPL-3.0-only"
 keywords = ["forensics", "dfir", "artefacts", "parsers", "exhume"]
 include = ["Cargo.toml", "LICENSE", "README.md", "src/**/*.rs", "examples/**/*.rs"]
 
+[features]
+# Uses the same native SQLite library as SQLx in applications embedding this crate.
+# macOS uses CommonCrypto; other targets need the SQLCipher build's crypto provider.
+sqlcipher = ["libsqlite3-sys/bundled-sqlcipher"]
+
 [dependencies]
 anyhow = "1.0.100"
 base64 = "0.22"
