@@ -31,7 +31,8 @@ use crate::core::{
 };
 use crate::formats::sqlite::sqlcipher::{SqlCipherError, SqlCipherKey, SqlCipherProfile};
 use crate::formats::sqlite::{
-    SqliteConnection, SqliteEvidence, SqliteSchema, select_column, sqlite_source_json,
+    SqliteConnection, SqliteEvidence, SqliteSchema, SqliteStatement, select_column,
+    sqlite_source_json,
 };
 use crate::formats::timestamps::unix_millis_to_json;
 use anyhow::Result;
@@ -455,7 +456,6 @@ impl Parser for SignalDesktopParser {
         }
 
         let directory = load_directory(&conn, &schema)?;
-        let attachments = load_table_attachments(&conn, &schema)?;
         let edits = load_edit_read_status(&conn, &schema)?;
         let store = Store {
             evidence: &evidence,
@@ -463,15 +463,7 @@ impl Parser for SignalDesktopParser {
         };
 
         emit_conversations(&directory, &store, sink)?;
-        emit_messages(
-            &conn,
-            &schema,
-            &store,
-            &directory,
-            &attachments,
-            &edits,
-            sink,
-        )
+        emit_messages(&conn, &schema, &store, &directory, &edits, sink)
     }
 }
 
@@ -699,102 +691,98 @@ fn group_member_ids(blob: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Attachments of the current revision of every message, from the
-/// `message_attachments` table (absent before migration 1360).
-fn load_table_attachments(
-    conn: &SqliteConnection,
-    schema: &SqliteSchema,
-) -> Result<HashMap<String, Vec<SignalAttachment>>> {
-    const TABLE: &str = "message_attachments";
-    let mut by_message: HashMap<String, Vec<SignalAttachment>> = HashMap::new();
-    if !schema.has_column(TABLE, "messageId") {
-        return Ok(by_message);
-    }
+/// Columns of `message_attachments` the parser interprets, in the order they
+/// are selected; the ones reported verbatim follow.
+const ATTACHMENT_INTERPRETED_COLUMNS: &[&str] = &[
+    "attachmentType",
+    "orderInMessage",
+    "contentType",
+    "fileName",
+    "path",
+    "size",
+    "localKey",
+    "plaintextHash",
+    "caption",
+    "width",
+    "height",
+    "duration",
+    "thumbnailPath",
+];
 
-    let revision_filter = if schema.has_column(TABLE, "editHistoryIndex") {
-        format!("WHERE a.editHistoryIndex = {ROOT_EDIT_HISTORY_INDEX}")
-    } else {
-        String::new()
-    };
-    // Interpreted columns first, then the ones reported verbatim.
-    const INTERPRETED: &[&str] = &[
-        "attachmentType",
-        "orderInMessage",
-        "contentType",
-        "fileName",
-        "path",
-        "size",
-        "localKey",
-        "plaintextHash",
-        "caption",
-        "width",
-        "height",
-        "duration",
-        "thumbnailPath",
-    ];
-    const FIRST_VERBATIM: usize = 2 + INTERPRETED.len();
+/// The select list and the join that bring the attachments of the current
+/// revision of a message next to its row, from the `message_attachments` table
+/// (absent before migration 1360). A message with several attachments comes
+/// back once per attachment, so nothing is held in memory but the message
+/// being read.
+fn attachment_join(schema: &SqliteSchema) -> Option<(String, String)> {
+    const TABLE: &str = "message_attachments";
+    if !schema.has_column(TABLE, "messageId") {
+        return None;
+    }
     let verbatim = ATTACHMENT_TEXT_COLUMNS
         .iter()
         .chain(ATTACHMENT_INTEGER_COLUMNS)
         .map(|(column, _)| column);
-    let columns: Vec<String> = INTERPRETED
+    let columns: Vec<String> = ATTACHMENT_INTERPRETED_COLUMNS
         .iter()
         .chain(verbatim)
         .enumerate()
-        .map(|(index, column)| select_column(schema, TABLE, "a", column, &format!("c{index}")))
+        .map(|(index, column)| select_column(schema, TABLE, "a", column, &format!("a{index}")))
         .collect();
-    let sql = format!(
-        "SELECT a.messageId AS message_id, a.rowid AS row_id, {} \
-         FROM {TABLE} a {revision_filter} ORDER BY a.rowid;",
-        columns.join(", "),
-    );
+    let revision_filter = if schema.has_column(TABLE, "editHistoryIndex") {
+        format!("AND a.editHistoryIndex = {ROOT_EDIT_HISTORY_INDEX}")
+    } else {
+        String::new()
+    };
+    // `messages.id` is declared STRING, which SQLite gives NUMERIC affinity,
+    // and a comparison with that column cannot use the index of the TEXT
+    // column `messageId`: every message would scan the whole table. Compared
+    // with a text value, the lookup goes through the primary key.
+    Some((
+        format!("a.rowid AS attachment_row_id, {}", columns.join(", ")),
+        format!("LEFT JOIN {TABLE} a ON a.messageId = CAST(m.id AS TEXT) {revision_filter}"),
+    ))
+}
 
-    conn.query_rows(&sql, |row| {
-        let Some(message_id) = row.text(0) else {
-            return Ok(());
-        };
-        // Most of these columns are empty on most rows; keep what is set.
-        let mut recorded = Vec::new();
-        let mut index = FIRST_VERBATIM as i32;
-        for (_, key) in ATTACHMENT_TEXT_COLUMNS {
-            if let Some(value) = row.text(index) {
-                recorded.push((*key, Value::String(value)));
-            }
-            index += 1;
+/// The attachment joined to this row, if there is one; `first` is the index of
+/// its row id.
+fn joined_attachment(row: &SqliteStatement<'_>, first: i32) -> Option<SignalAttachment> {
+    let rowid = row.i64(first)?;
+    let column = |offset: i32| first + 1 + offset;
+    // Most of the verbatim columns are empty on most rows; keep what is set.
+    let mut recorded = Vec::new();
+    let mut index = column(ATTACHMENT_INTERPRETED_COLUMNS.len() as i32);
+    for (_, key) in ATTACHMENT_TEXT_COLUMNS {
+        if let Some(value) = row.text(index) {
+            recorded.push((*key, Value::String(value)));
         }
-        for (_, key) in ATTACHMENT_INTEGER_COLUMNS {
-            if let Some(value) = row.i64(index) {
-                recorded.push((*key, json!(value)));
-            }
-            index += 1;
-        }
-        by_message
-            .entry(message_id)
-            .or_default()
-            .push(SignalAttachment {
-                rowid: row.i64(1),
-                attachment_type: row.text(2).unwrap_or_else(|| "attachment".to_owned()),
-                order: row.i64(3),
-                content_type: row.text(4),
-                file_name: row.text(5),
-                path: row.text(6),
-                size: row.i64(7),
-                local_key: row.text(8),
-                plaintext_hash: row.text(9),
-                caption: row.text(10),
-                width: row.i64(11),
-                height: row.i64(12),
-                duration: row.f64(13),
-                thumbnail_path: row.text(14),
-                recorded,
-            });
-        Ok(())
-    })?;
-
-    for attachments in by_message.values_mut() {
-        attachments.sort_by_key(|attachment| attachment.order);
+        index += 1;
     }
-    Ok(by_message)
+    for (_, key) in ATTACHMENT_INTEGER_COLUMNS {
+        if let Some(value) = row.i64(index) {
+            recorded.push((*key, json!(value)));
+        }
+        index += 1;
+    }
+    Some(SignalAttachment {
+        rowid: Some(rowid),
+        attachment_type: row
+            .text(column(0))
+            .unwrap_or_else(|| "attachment".to_owned()),
+        order: row.i64(column(1)),
+        content_type: row.text(column(2)),
+        file_name: row.text(column(3)),
+        path: row.text(column(4)),
+        size: row.i64(column(5)),
+        local_key: row.text(column(6)),
+        plaintext_hash: row.text(column(7)),
+        caption: row.text(column(8)),
+        width: row.i64(column(9)),
+        height: row.i64(column(10)),
+        duration: row.f64(column(11)),
+        thumbnail_path: row.text(column(12)),
+        recorded,
+    })
 }
 
 /// Attachments Signal kept inline in the message `json` before migration 1360:
@@ -881,20 +869,46 @@ fn emit_conversations(
     Ok(())
 }
 
-fn emit_messages(
-    conn: &SqliteConnection,
-    schema: &SqliteSchema,
-    store: &Store,
-    directory: &Directory,
-    table_attachments: &HashMap<String, Vec<SignalAttachment>>,
-    edits: &EditReadStatus,
-    sink: &mut dyn FnMut(ObjectParsed) -> Result<()>,
-) -> Result<()> {
+/// The promoted columns of one `messages` row, in the order they are selected.
+struct MessageRow {
+    rowid: Option<i64>,
+    id: Option<String>,
+    message_type: String,
+    conversation_id: String,
+    json: Option<String>,
+    body: Option<String>,
+    sent_at: Option<i64>,
+    received_at_ms: Option<i64>,
+    read_status: Option<i64>,
+    seen_status: Option<i64>,
+    is_erased: Option<bool>,
+    source_service_id: Option<String>,
+    legacy_source_uuid: Option<String>,
+    source_e164: Option<String>,
+    source_device: Option<i64>,
+    is_view_once: Option<bool>,
+    expire_timer: Option<i64>,
+    expiration_start: Option<i64>,
+    story_id: Option<String>,
+}
+
+/// Number of columns selected from `messages`; the joined attachment follows.
+const MESSAGE_COLUMNS: i32 = 19;
+
+/// One row per message, or per attachment of the current revision of a
+/// message, the rows of one message being consecutive.
+fn message_query(schema: &SqliteSchema) -> String {
     const T: &str = "messages";
     let column = |name: &str, alias: &str| select_column(schema, T, "m", name, alias);
-    let sql = format!(
+    let (attachment_columns, join) = match attachment_join(schema) {
+        Some((columns, join)) => (format!(", {columns}"), join),
+        None => (String::new(), String::new()),
+    };
+    // Ordered by message only: its attachments are put in order once they
+    // are all read.
+    format!(
         "SELECT m.rowid AS row_id, m.id AS id, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, \
-         {}, {}, {}, {}, {} FROM messages m ORDER BY m.rowid;",
+         {}, {}, {}, {}, {}{attachment_columns} FROM messages m {join} ORDER BY m.rowid;",
         column("type", "message_type"),
         column("conversationId", "conversation_id"),
         column("json", "json"),
@@ -912,223 +926,300 @@ fn emit_messages(
         column("expireTimer", "expire_timer"),
         column("expirationStartTimestamp", "expiration_start"),
         column("storyId", "story_id"),
-    );
+    )
+}
 
+fn emit_messages(
+    conn: &SqliteConnection,
+    schema: &SqliteSchema,
+    store: &Store,
+    directory: &Directory,
+    edits: &EditReadStatus,
+    sink: &mut dyn FnMut(ObjectParsed) -> Result<()>,
+) -> Result<()> {
+    let has_join = attachment_join(schema).is_some();
+    let sql = message_query(schema);
+
+    // The message being read and the attachments joined to it so far.
+    let mut pending: Option<(MessageRow, Vec<SignalAttachment>)> = None;
     conn.query_rows(&sql, |row| {
-        let message_type = row.text(2).unwrap_or_default();
-        if !CHAT_TYPES.contains(&message_type.as_str()) {
-            return Ok(());
-        }
         let rowid = row.i64(0);
-        let message_id = row.text(1);
-        let conversation_id = row.text(3).unwrap_or_default();
-        let blob = parse_json(row.text(4));
-        let text_of = |key: &str| blob[key].as_str().map(str::to_owned);
-
-        let unknown_conversation = ConvInfo::default();
-        let conv = directory
-            .conversations
-            .get(&conversation_id)
-            .unwrap_or(&unknown_conversation);
-        let direction = if message_type == "outgoing" {
-            Direction::Outgoing
-        } else {
-            Direction::Incoming
-        };
-
-        let source_service_id = non_empty(row.text(11))
-            .or_else(|| non_empty(row.text(12)))
-            .or_else(|| text_of("sourceServiceId"))
-            .or_else(|| text_of("sourceUuid"));
-        // The blob keeps the number as written; the column had a numeric
-        // affinity before migration 1270, which drops the leading "+".
-        let source_e164 = text_of("source").or_else(|| row.text(13));
-        let sender = match direction {
-            Direction::Outgoing => Party {
-                id: directory.me.clone(),
-                display_name: directory
-                    .me
-                    .as_ref()
-                    .and_then(|me| directory.names.get(me).cloned()),
-                is_self: true,
-            },
-            // The author column is set for group messages; a one-to-one
-            // message without it comes from the conversation's contact.
-            _ => match source_service_id.as_deref().or(conv.service_id.as_deref()) {
-                Some(id) => directory.party(id),
-                None => Party {
-                    id: source_e164.clone(),
-                    display_name: None,
-                    is_self: false,
-                },
-            },
-        };
-
-        // Like the other chat parsers, a message names its counterpart only:
-        // the contact, or the author of a group message. The full roster of a
-        // group is in its chat record.
-        let participants = match direction {
-            _ if conv.member_ids.is_empty() => directory.participants(conv),
-            Direction::Outgoing => Vec::new(),
-            _ => vec![sender.clone()],
-        };
-
-        // Table rows win; the inline list only exists on older databases.
-        let inline = json_attachments(&blob);
-        let attachments = message_id
+        if pending
             .as_ref()
-            .and_then(|id| table_attachments.get(id))
-            .unwrap_or(&inline);
-
-        // An edit replaces the body but keeps its own state: the send state in
-        // the newest entry of `editHistory`, the read status in
-        // `edited_messages`. The top-level values still describe the original.
-        let revision = &blob["editHistory"][0];
-        let revision_sent_at = blob["editMessageTimestamp"]
-            .as_i64()
-            .or_else(|| revision["timestamp"].as_i64());
-        let read_status = row.i64(8);
-        let revision_read_status = message_id
-            .as_ref()
-            .zip(revision_sent_at)
-            .and_then(|(id, sent_at)| edits.get(&(id.clone(), sent_at)).copied())
-            .or_else(|| revision["readStatus"].as_i64());
-        let send_states = if revision["sendStateByConversationId"].is_object() {
-            &revision["sendStateByConversationId"]
-        } else {
-            &blob["sendStateByConversationId"]
-        };
-
-        // `isErased` is not deletion: Signal also erases a view-once message
-        // once viewed, sent or expired, and messages it cannot display.
-        let is_erased = row.bool(10).or_else(|| blob["isErased"].as_bool());
-        let deleted = blob
-            .is_object()
-            .then(|| blob["deletedForEveryone"].as_bool() == Some(true));
-        let state = match direction {
-            Direction::Outgoing => {
-                let (delivered, read) =
-                    outgoing_state(send_states, directory.own_conversation.as_deref());
-                MessageState {
-                    read,
-                    delivered,
-                    deleted,
-                }
+            .is_none_or(|(message, _)| message.rowid != rowid)
+        {
+            if let Some((message, attachments)) = pending.take() {
+                emit_message(store, directory, edits, message, attachments, sink)?;
             }
-            _ => MessageState {
-                read: read_flag(revision_read_status.or(read_status)),
-                delivered: None,
-                deleted,
+            let message_type = row.text(2).unwrap_or_default();
+            if !CHAT_TYPES.contains(&message_type.as_str()) {
+                return Ok(());
+            }
+            pending = Some((
+                MessageRow {
+                    rowid,
+                    id: row.text(1),
+                    message_type,
+                    conversation_id: row.text(3).unwrap_or_default(),
+                    json: row.text(4),
+                    body: row.text(5),
+                    sent_at: row.i64(6),
+                    received_at_ms: row.i64(7),
+                    read_status: row.i64(8),
+                    seen_status: row.i64(9),
+                    is_erased: row.bool(10),
+                    source_service_id: row.text(11),
+                    legacy_source_uuid: row.text(12),
+                    source_e164: row.text(13),
+                    source_device: row.i64(14),
+                    is_view_once: row.bool(15),
+                    expire_timer: row.i64(16),
+                    expiration_start: row.i64(17),
+                    story_id: row.text(18),
+                },
+                Vec::new(),
+            ));
+        }
+        if has_join
+            && let Some((_, attachments)) = pending.as_mut()
+            && let Some(attachment) = joined_attachment(row, MESSAGE_COLUMNS)
+        {
+            attachments.push(attachment);
+        }
+        Ok(())
+    })?;
+    match pending {
+        Some((message, attachments)) => {
+            emit_message(store, directory, edits, message, attachments, sink)
+        }
+        None => Ok(()),
+    }
+}
+
+/// Normalise one chat message and emit it, followed by one record per file.
+fn emit_message(
+    store: &Store,
+    directory: &Directory,
+    edits: &EditReadStatus,
+    row: MessageRow,
+    mut table_attachments: Vec<SignalAttachment>,
+    sink: &mut dyn FnMut(ObjectParsed) -> Result<()>,
+) -> Result<()> {
+    const T: &str = "messages";
+    let message_type = row.message_type;
+    let rowid = row.rowid;
+    let message_id = row.id;
+    let conversation_id = row.conversation_id;
+    let blob = parse_json(row.json);
+    let text_of = |key: &str| blob[key].as_str().map(str::to_owned);
+
+    let unknown_conversation = ConvInfo::default();
+    let conv = directory
+        .conversations
+        .get(&conversation_id)
+        .unwrap_or(&unknown_conversation);
+    let direction = if message_type == "outgoing" {
+        Direction::Outgoing
+    } else {
+        Direction::Incoming
+    };
+
+    let source_service_id = non_empty(row.source_service_id)
+        .or_else(|| non_empty(row.legacy_source_uuid))
+        .or_else(|| text_of("sourceServiceId"))
+        .or_else(|| text_of("sourceUuid"));
+    // The blob keeps the number as written; the column had a numeric
+    // affinity before migration 1270, which drops the leading "+".
+    let source_e164 = text_of("source").or(row.source_e164);
+    let sender = match direction {
+        Direction::Outgoing => Party {
+            id: directory.me.clone(),
+            display_name: directory
+                .me
+                .as_ref()
+                .and_then(|me| directory.names.get(me).cloned()),
+            is_self: true,
+        },
+        // The author column is set for group messages; a one-to-one
+        // message without it comes from the conversation's contact.
+        _ => match source_service_id.as_deref().or(conv.service_id.as_deref()) {
+            Some(id) => directory.party(id),
+            None => Party {
+                id: source_e164.clone(),
+                display_name: None,
+                is_self: false,
             },
-        };
+        },
+    };
 
-        let sent_at = row.i64(6).or_else(|| blob["sent_at"].as_i64());
-        let received_at = row.i64(7).or_else(|| blob["received_at_ms"].as_i64());
-        let body = row.text(5).or_else(|| text_of("body"));
-        let flags = blob["flags"].as_i64();
-        let is_view_once = row.bool(15).or_else(|| blob["isViewOnce"].as_bool());
-        let content_kind = content_kind(&blob, flags, is_erased, is_view_once, &body, attachments);
+    // Like the other chat parsers, a message names its counterpart only:
+    // the contact, or the author of a group message. The full roster of a
+    // group is in its chat record.
+    let participants = match direction {
+        _ if conv.member_ids.is_empty() => directory.participants(conv),
+        Direction::Outgoing => Vec::new(),
+        _ => vec![sender.clone()],
+    };
 
-        // One record per file of the message, next to the inline list: the
-        // indexer resolves and links attachments from these.
-        let context = MessageContext {
-            rowid,
-            id: message_id.as_deref(),
-            signal_type: &message_type,
-            content_kind,
-            body: body.as_deref(),
-            direction,
-            sender: &sender,
-            conversation_id: &conversation_id,
-            conversation: conv,
-            sent_at,
-            received_at,
-        };
-        let attachment_records: Vec<ObjectParsed> = attachments
+    // Table rows win; the inline list only exists on older databases.
+    let attachments = if table_attachments.is_empty() {
+        json_attachments(&blob)
+    } else {
+        table_attachments.sort_by_key(|attachment| (attachment.order, attachment.rowid));
+        table_attachments
+    };
+    let attachments = attachments.as_slice();
+
+    // An edit replaces the body but keeps its own state: the send state in
+    // the newest entry of `editHistory`, the read status in
+    // `edited_messages`. The top-level values still describe the original.
+    let revision = &blob["editHistory"][0];
+    let revision_sent_at = blob["editMessageTimestamp"]
+        .as_i64()
+        .or_else(|| revision["timestamp"].as_i64());
+    let read_status = row.read_status;
+    let revision_read_status = message_id
+        .as_ref()
+        .zip(revision_sent_at)
+        .and_then(|(id, sent_at)| edits.get(&(id.clone(), sent_at)).copied())
+        .or_else(|| revision["readStatus"].as_i64());
+    let send_states = if revision["sendStateByConversationId"].is_object() {
+        &revision["sendStateByConversationId"]
+    } else {
+        &blob["sendStateByConversationId"]
+    };
+
+    // `isErased` is not deletion: Signal also erases a view-once message
+    // once viewed, sent or expired, and messages it cannot display.
+    let is_erased = row.is_erased.or_else(|| blob["isErased"].as_bool());
+    let deleted = blob
+        .is_object()
+        .then(|| blob["deletedForEveryone"].as_bool() == Some(true));
+    let state = match direction {
+        Direction::Outgoing => {
+            let (delivered, read) =
+                outgoing_state(send_states, directory.own_conversation.as_deref());
+            MessageState {
+                read,
+                delivered,
+                deleted,
+            }
+        }
+        _ => MessageState {
+            read: read_flag(revision_read_status.or(read_status)),
+            delivered: None,
+            deleted,
+        },
+    };
+
+    let sent_at = row.sent_at.or_else(|| blob["sent_at"].as_i64());
+    let received_at = row
+        .received_at_ms
+        .or_else(|| blob["received_at_ms"].as_i64());
+    let body = row.body.or_else(|| text_of("body"));
+    let flags = blob["flags"].as_i64();
+    let is_view_once = row.is_view_once.or_else(|| blob["isViewOnce"].as_bool());
+    let content_kind = content_kind(&blob, flags, is_erased, is_view_once, &body, attachments);
+
+    // One record per file of the message, next to the inline list: the
+    // indexer resolves and links attachments from these.
+    let context = MessageContext {
+        rowid,
+        id: message_id.as_deref(),
+        signal_type: &message_type,
+        content_kind,
+        body: body.as_deref(),
+        direction,
+        sender: &sender,
+        conversation_id: &conversation_id,
+        conversation: conv,
+        sent_at,
+        received_at,
+    };
+    let attachment_records: Vec<ObjectParsed> = attachments
+        .iter()
+        .filter(|attachment| attachment.is_message_file())
+        .map(|attachment| attachment_record(store, attachment, &context))
+        .collect();
+
+    let message = ChatMessage {
+        parser: PARSER_NAME,
+        platform: PLATFORM,
+        app: APP,
+        conversation: Conversation {
+            id: conversation_id,
+            display_name: conv.name.clone(),
+            participants,
+        },
+        direction,
+        sender,
+        timestamp: unix_millis_to_json(sent_at),
+        sent: unix_millis_to_json(sent_at),
+        received: unix_millis_to_json(received_at),
+        body,
+        attachments: attachments
             .iter()
             .filter(|attachment| attachment.is_message_file())
-            .map(|attachment| attachment_record(store, attachment, &context))
-            .collect();
-
-        let message = ChatMessage {
-            parser: PARSER_NAME,
-            platform: PLATFORM,
-            app: APP,
-            conversation: Conversation {
-                id: conversation_id,
-                display_name: conv.name.clone(),
-                participants,
+            .map(SignalAttachment::to_canonical)
+            .collect(),
+        state,
+        source: store.source(T, message_id.as_deref(), rowid),
+        details: json!({
+            "message": {
+                "signal_type": message_type,
+                // What the row is when it is not plain text or media.
+                "content_kind": content_kind,
+                "flags": flags,
+                "read_status": read_status,
+                "revision_read_status": revision_read_status,
+                "seen_status": row.seen_status,
+                "source_e164": source_e164,
+                "source_device": row.source_device,
+                "is_erased": is_erased,
+                "is_view_once": is_view_once,
+                "expire_timer": row.expire_timer.or_else(|| blob["expireTimer"].as_i64()),
+                "expiration_start": unix_millis_to_json(
+                    row.expiration_start.or_else(|| blob["expirationStartTimestamp"].as_i64()),
+                ),
+                "deleted_for_everyone": blob["deletedForEveryone"].as_bool(),
+                // Set on a reply to a story, which Signal shows apart
+                // from the conversation.
+                "story_id": row.story_id.or_else(|| text_of("storyId")),
             },
-            direction,
-            sender,
-            timestamp: unix_millis_to_json(sent_at),
-            sent: unix_millis_to_json(sent_at),
-            received: unix_millis_to_json(received_at),
-            body,
-            attachments: attachments
+            "conversation": {
+                "type": conv.conv_type,
+                "group_id": conv.group_id,
+            },
+            // Every attachment row, including the long-message body,
+            // quote, link-preview, contact and sticker ones.
+            "attachments": attachments
                 .iter()
-                .filter(|attachment| attachment.is_message_file())
-                .map(SignalAttachment::to_canonical)
-                .collect(),
-            state,
-            source: store.source(T, message_id.as_deref(), rowid),
-            details: json!({
-                "message": {
-                    "signal_type": message_type,
-                    // What the row is when it is not plain text or media.
-                    "content_kind": content_kind,
-                    "flags": flags,
-                    "read_status": read_status,
-                    "revision_read_status": revision_read_status,
-                    "seen_status": row.i64(9),
-                    "source_e164": source_e164,
-                    "source_device": row.i64(14),
-                    "is_erased": is_erased,
-                    "is_view_once": is_view_once,
-                    "expire_timer": row.i64(16).or_else(|| blob["expireTimer"].as_i64()),
-                    "expiration_start": unix_millis_to_json(
-                        row.i64(17).or_else(|| blob["expirationStartTimestamp"].as_i64()),
-                    ),
-                    "deleted_for_everyone": blob["deletedForEveryone"].as_bool(),
-                    // Set on a reply to a story, which Signal shows apart
-                    // from the conversation.
-                    "story_id": row.text(18).or_else(|| text_of("storyId")),
-                },
-                "conversation": {
-                    "type": conv.conv_type,
-                    "group_id": conv.group_id,
-                },
-                // Every attachment row, including the long-message body,
-                // quote, link-preview, contact and sticker ones.
-                "attachments": attachments
-                    .iter()
-                    .map(SignalAttachment::to_details)
-                    .collect::<Vec<_>>(),
-                "reactions": reactions(&blob),
-                "edit_history": edit_history(&blob),
-                "send_state_by_conversation_id": blob["sendStateByConversationId"].clone(),
-                // Content Signal stores as structured data, verbatim.
-                "quote": blob["quote"].clone(),
-                "body_ranges": blob["bodyRanges"].clone(),
-                "sticker": blob["sticker"].clone(),
-                "poll": blob["poll"].clone(),
-                "contact": blob["contact"].clone(),
-                "payment": blob["payment"].clone(),
-                "gift_badge": blob["giftBadge"].clone(),
-                "group_update": blob["group_update"].clone(),
-                "errors": blob["errors"].clone(),
-            }),
-        };
+                .map(SignalAttachment::to_details)
+                .collect::<Vec<_>>(),
+            "reactions": reactions(&blob),
+            "edit_history": edit_history(&blob),
+            "send_state_by_conversation_id": blob["sendStateByConversationId"].clone(),
+            // Content Signal stores as structured data, verbatim.
+            "quote": blob["quote"].clone(),
+            "body_ranges": blob["bodyRanges"].clone(),
+            "sticker": blob["sticker"].clone(),
+            "poll": blob["poll"].clone(),
+            "contact": blob["contact"].clone(),
+            "payment": blob["payment"].clone(),
+            "gift_badge": blob["giftBadge"].clone(),
+            "group_update": blob["group_update"].clone(),
+            "errors": blob["errors"].clone(),
+        }),
+    };
 
-        let mut object: ObjectParsed = message.into();
-        if object.text.is_empty()
-            && let Some(text) = structured_text(&blob)
-        {
-            object.text = text;
-        }
-        sink(object)?;
-        attachment_records.into_iter().try_for_each(&mut *sink)
-    })
+    let mut object: ObjectParsed = message.into();
+    if object.text.is_empty()
+        && let Some(text) = structured_text(&blob)
+    {
+        object.text = text;
+    }
+    sink(object)?;
+    attachment_records.into_iter().try_for_each(&mut *sink)
 }
 
 /// A `mobile.communication.attachment` record, in the shape the WhatsApp and
@@ -1508,7 +1599,9 @@ mod tests {
                 ('m3', -1, 'attachment', 0, 20, 'image/jpeg', 'ab/first', 'a.jpg', 'a2V5', 'hash', 'look'),
                 ('m3', -1, 'long-message', 0, 5000, 'text/x-signal-plain', 'ab/long', NULL, NULL, NULL, NULL),
                 ('m3', 0, 'attachment', 0, 20, 'image/png', 'ab/old-revision', 'old.png', NULL, NULL, NULL),
-                ('m10', -1, 'sticker', 0, 300, 'image/webp', 'st/1', NULL, NULL, NULL, NULL);
+                ('m10', -1, 'sticker', 0, 300, 'image/webp', 'st/1', NULL, NULL, NULL, NULL),
+                ('m18', -1, 'attachment', 0, 5, 'image/png', 'sy/1', 'system.png', NULL, NULL, NULL),
+                ('m18', -1, 'attachment', 1, 5, 'image/png', 'sy/2', 'system2.png', NULL, NULL, NULL);
             UPDATE message_attachments SET width = 640, height = 480,
                 thumbnailPath = 'ab/first-thumb', thumbnailLocalKey = 'dGh1bWI=',
                 digest = 'ZGlnZXN0', version = 2, transitCdnKey = 'cdn-key',
@@ -1669,6 +1762,37 @@ mod tests {
         sql += &row(18, "group-v2-change", "c-team", "NULL", "{}", &[]);
         sql += &row(19, "call-history", "c-alice", "NULL", "{}", &[]);
         sql
+    }
+
+    /// Signal declares `messages.id` STRING and `message_attachments.messageId`
+    /// TEXT. Joined as they are, no index applies and each message scans
+    /// every attachment row.
+    #[test]
+    fn looks_attachments_up_through_the_primary_key() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let conn = SqliteConnection::create_for_test(&tmp.path().join("db.sqlite"))?;
+        conn.execute_batch(
+            "CREATE TABLE messages (rowid INTEGER PRIMARY KEY ASC, id STRING UNIQUE, json TEXT,
+                 type STRING, conversationId STRING);
+             CREATE TABLE message_attachments (messageId TEXT NOT NULL,
+                 editHistoryIndex INTEGER NOT NULL, attachmentType TEXT NOT NULL,
+                 orderInMessage INTEGER NOT NULL, size INTEGER NOT NULL,
+                 contentType TEXT NOT NULL, path TEXT,
+                 PRIMARY KEY (messageId, editHistoryIndex, attachmentType, orderInMessage))
+                 STRICT;",
+        )?;
+        let mut plan = Vec::new();
+        let query = format!("EXPLAIN QUERY PLAN {}", message_query(&conn.schema()?));
+        conn.query_rows(&query, |row| {
+            plan.extend(row.text(3));
+            Ok(())
+        })?;
+        assert!(
+            plan.iter()
+                .any(|step| step.starts_with("SEARCH a USING") && step.contains("(messageId=?")),
+            "{plan:?}"
+        );
+        Ok(())
     }
 
     #[test]
@@ -1866,6 +1990,12 @@ mod tests {
         // revision), one for the sticker of m10.
         let records = attachment_records(&objects);
         assert_eq!(records.len(), 3);
+        // m18 is a group change: neither the row nor its attachments come out.
+        assert!(
+            records
+                .iter()
+                .all(|record| record.json["message"]["id"] != "m18")
+        );
         let m3_at = objects
             .iter()
             .position(|object| object.json["source"]["id"] == "m3")
