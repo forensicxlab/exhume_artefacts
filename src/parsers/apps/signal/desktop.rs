@@ -35,7 +35,7 @@ use crate::formats::sqlite::{
     sqlite_source_json,
 };
 use crate::formats::timestamps::unix_millis_to_json;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde_json::{Map, Value, json};
 use std::collections::{BTreeMap, HashMap};
 
@@ -462,6 +462,11 @@ impl Parser for SignalDesktopParser {
             cipher,
         };
 
+        // Compiled once before the first record: a table this query cannot
+        // read must not surface after the conversations are out.
+        conn.query_rows(&format!("EXPLAIN {}", message_query(&schema)), |_| Ok(()))
+            .context("cannot read the messages of this database")?;
+
         emit_conversations(&directory, &store, sink)?;
         emit_messages(&conn, &schema, &store, &directory, &edits, sink)
     }
@@ -498,6 +503,10 @@ fn open_database(
             Ok((SqliteConnection::open(evidence.path())?, None))
         }
         Leading::Nothing => anyhow::bail!("{} is empty", evidence.source_label()),
+        Leading::Fragment => anyhow::bail!(
+            "{} is smaller than one database page and does not start with the SQLite header",
+            evidence.source_label()
+        ),
         Leading::Other => {
             // A key cannot help a build that has no SQLCipher backend.
             if !cfg!(feature = "sqlcipher") {
@@ -519,6 +528,8 @@ fn open_database(
 enum Leading {
     SqliteHeader,
     Nothing,
+    /// Shorter than the smallest page SQLite or SQLCipher writes.
+    Fragment,
     Other,
 }
 
@@ -527,13 +538,15 @@ enum Leading {
 fn leading_bytes(path: &std::path::Path) -> Result<Leading> {
     use std::io::Read;
     const MAGIC: &[u8; 16] = b"SQLite format 3\0";
+    const SMALLEST_PAGE: u64 = 512;
+    let file = std::fs::File::open(path)?;
+    let size = file.metadata()?.len();
     let mut start = Vec::with_capacity(MAGIC.len());
-    std::fs::File::open(path)?
-        .take(MAGIC.len() as u64)
-        .read_to_end(&mut start)?;
+    file.take(MAGIC.len() as u64).read_to_end(&mut start)?;
     Ok(match start.as_slice() {
         [] => Leading::Nothing,
         start if start == MAGIC => Leading::SqliteHeader,
+        _ if size < SMALLEST_PAGE => Leading::Fragment,
         _ => Leading::Other,
     })
 }
@@ -838,6 +851,7 @@ fn emit_conversations(
             "record_type": "chat",
             "source": store.source("conversations", Some(id), conv.rowid),
             "chat": {
+                "rowid": conv.rowid,
                 "id": id,
                 "name": conv.name,
                 "contact_name": conv.contact_name,
@@ -1371,24 +1385,24 @@ fn structured_text(blob: &Value) -> Option<String> {
 /// In a group this means "at least one member"; the complete map stays in
 /// `details`. The owner's own entry only tracks the sync to their linked
 /// devices, so it never counts for another recipient: it is read only when it
-/// is the sole entry (Note to Self).
+/// is the sole entry of the map (Note to Self), the rule of Signal's
+/// `isMessageJustForMe`.
 fn outgoing_state(states: &Value, own_conversation: Option<&str>) -> (Option<bool>, Option<bool>) {
     let Some(states) = states.as_object() else {
         return (None, None);
     };
-    let status_of = |state: &Value| state["status"].as_str().map(str::to_owned);
-    let mut statuses: Vec<String> = states
+    let just_for_owner = states.len() == 1;
+    let statuses: Vec<&str> = states
         .iter()
-        .filter(|(conversation, _)| Some(conversation.as_str()) != own_conversation)
-        .filter_map(|(_, state)| status_of(state))
+        .filter(|(conversation, _)| {
+            just_for_owner || Some(conversation.as_str()) != own_conversation
+        })
+        .filter_map(|(_, state)| state["status"].as_str())
         .collect();
-    if statuses.is_empty() {
-        statuses = states.values().filter_map(status_of).collect();
-    }
     if statuses.is_empty() {
         return (None, None);
     }
-    let any = |accepted: &[&str]| statuses.iter().any(|s| accepted.contains(&s.as_str()));
+    let any = |accepted: &[&str]| statuses.iter().any(|status| accepted.contains(status));
     (
         Some(any(&["Delivered", "Read", "Viewed"])),
         any(&["Read", "Viewed"]).then_some(true),
@@ -1573,7 +1587,8 @@ mod tests {
                 contentType TEXT NOT NULL, path TEXT, fileName TEXT, localKey TEXT,
                 plaintextHash TEXT, caption TEXT, width INTEGER, height INTEGER,
                 duration REAL, thumbnailPath TEXT, thumbnailLocalKey TEXT, digest TEXT,
-                version INTEGER, transitCdnKey TEXT, transitCdnNumber INTEGER, pending INTEGER);
+                version INTEGER, transitCdnKey TEXT, transitCdnNumber INTEGER, pending INTEGER,
+                PRIMARY KEY (messageId, editHistoryIndex, attachmentType, orderInMessage)) STRICT;
             CREATE TABLE edited_messages (messageId STRING, sentAt INTEGER,
                 readStatus INTEGER, conversationId STRING);
 
@@ -1793,6 +1808,82 @@ mod tests {
             "{plan:?}"
         );
         Ok(())
+    }
+
+    /// The last message has no following row to close it.
+    #[test]
+    fn emits_the_attachments_of_the_last_message() -> Result<()> {
+        let objects = parse(&format!(
+            "{}
+             INSERT INTO messages (rowid, id, json, type, conversationId, sent_at) VALUES
+                 (90, 'last', '{{}}', 'incoming', 'c-alice', {T0});
+             INSERT INTO message_attachments (messageId, editHistoryIndex, attachmentType,
+                 orderInMessage, size, contentType, path) VALUES
+                 ('last', -1, 'attachment', 1, 2, 'image/png', 'zz/second'),
+                 ('last', -1, 'attachment', 0, 1, 'image/png', 'zz/first'),
+                 ('last', 0, 'attachment', 0, 3, 'image/png', 'zz/earlier-revision');",
+            current_schema()
+        ))?;
+        let last = objects.len() - 3;
+        assert_eq!(objects[last].json["source"]["id"], "last");
+        let paths: Vec<_> = objects[last + 1..]
+            .iter()
+            .map(|record| {
+                assert_eq!(record.kind, "mobile.communication.attachment");
+                assert_eq!(record.json["message"]["id"], "last");
+                record.json["media"]["local_path"].clone()
+            })
+            .collect();
+        assert_eq!(paths, ["zz/first", "zz/second"]);
+        Ok(())
+    }
+
+    /// A table the message query cannot read is reported before the
+    /// conversations are emitted, not after.
+    #[test]
+    fn refuses_an_unreadable_attachment_table_before_the_first_record() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = tmp.path().join("db.sqlite");
+        SqliteConnection::create_for_test(&db)?.execute_batch(
+            "CREATE TABLE conversations (id STRING PRIMARY KEY ASC, json TEXT, type STRING);
+             CREATE TABLE messages (rowid INTEGER PRIMARY KEY ASC, id STRING UNIQUE, json TEXT,
+                 type STRING, conversationId STRING);
+             CREATE TABLE message_attachments (messageId TEXT PRIMARY KEY, path TEXT)
+                 WITHOUT ROWID;
+             INSERT INTO conversations VALUES ('c1', '{}', 'private');
+             INSERT INTO messages VALUES (1, 'm1', '{}', 'incoming', 'c1');",
+        )?;
+        let (result, objects) = run(ParserInput::Path(db), options(None, None));
+        let error = format!("{:#}", result.unwrap_err());
+        assert!(
+            error.starts_with("cannot read the messages of this database"),
+            "{error}"
+        );
+        assert!(objects.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn counts_the_owner_entry_only_when_it_is_alone() {
+        let state = |json: &str| outgoing_state(&serde_json::from_str(json).unwrap(), Some("me"));
+        // Note to Self.
+        assert_eq!(
+            state(r#"{"me":{"status":"Read"}}"#),
+            (Some(true), Some(true))
+        );
+        assert_eq!(state(r#"{"me":{"status":"Sent"}}"#), (Some(false), None));
+        // The sync to the owner's devices says nothing about the recipient.
+        assert_eq!(
+            state(r#"{"alice":{"status":"Sent"},"me":{"status":"Read"}}"#),
+            (Some(false), None)
+        );
+        // A recipient without a usable status: unknown, not the owner's state.
+        assert_eq!(
+            state(r#"{"alice":{},"me":{"status":"Read"}}"#),
+            (None, None)
+        );
+        assert_eq!(state(r#"{}"#), (None, None));
+        assert_eq!(state(r#"[]"#), (None, None));
     }
 
     #[test]
@@ -2305,6 +2396,18 @@ mod tests {
         assert!(objects.is_empty());
     }
 
+    /// A few bytes cannot be a database, encrypted or not: no key would help.
+    #[test]
+    fn rejects_a_fragment_without_asking_for_a_key() {
+        for fragment in [&b"SQLite for"[..], b"SQLite format 3", &[0x5a; 511]] {
+            let (result, objects) = run(ParserInput::Bytes(fragment.to_vec()), options(None, None));
+            let error = result.unwrap_err();
+            assert!(error.downcast_ref::<ParserInputError>().is_none());
+            assert!(error.to_string().contains("smaller than one database page"));
+            assert!(objects.is_empty());
+        }
+    }
+
     /// A build without the backend says so at once: a key would not help.
     #[cfg(not(feature = "sqlcipher"))]
     #[test]
@@ -2448,18 +2551,23 @@ mod tests {
         fn refuses_a_malformed_key_without_echoing_it() -> Result<()> {
             let tmp = tempfile::tempdir()?;
             let db = encrypted_db(tmp.path(), 4)?;
-            let malformed = b"correct horse battery staple";
-            let (result, objects) = run(ParserInput::Path(db), options(Some(malformed), None));
-            let error = result.unwrap_err();
-            let Some(ParserInputError::InvalidConfiguration { option, message }) =
-                error.downcast_ref()
-            else {
-                panic!("expected an invalid option, got {error:#}");
-            };
-            assert_eq!(option, "database_key");
-            assert!(message.contains("64 hexadecimal characters"));
-            assert!(!format!("{error:#}").contains("horse"));
-            assert!(objects.is_empty());
+            let not_hexadecimal = [b"horse".as_slice(), &[b'z'; 59]].concat();
+            for malformed in [b"correct horse battery staple".as_slice(), &not_hexadecimal] {
+                let (result, objects) = run(
+                    ParserInput::Path(db.clone()),
+                    options(Some(malformed), None),
+                );
+                let error = result.unwrap_err();
+                let Some(ParserInputError::InvalidConfiguration { option, message }) =
+                    error.downcast_ref()
+                else {
+                    panic!("expected an invalid option, got {error:#}");
+                };
+                assert_eq!(option, "database_key");
+                assert!(message.contains("64 hexadecimal characters"));
+                assert!(!format!("{error:#}").contains("horse"));
+                assert!(objects.is_empty());
+            }
             Ok(())
         }
 
