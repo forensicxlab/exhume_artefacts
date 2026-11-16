@@ -1,9 +1,23 @@
+//! Artefact parsing with reusable input, format and record support.
+//!
+//! - [`core`] defines parser contracts, invocation settings and output types.
+//! - [`input`] assembles evidence sources and provides their contents.
+//! - [`formats`] handles storage formats independently of concrete parsers.
+//! - [`parsers`] contains platform entry points and the parser registry.
+//!
+//! Internal application engines are shared by platform entry points. Public
+//! compatibility exports keep existing parser and SQLCipher import paths valid.
+
 pub mod cli;
 /// Core parsing traits, types, and shared functionality.
 pub mod core;
+/// Storage-format support shared by artefact parsers.
+pub mod formats;
 pub mod input;
 /// Concrete parser implementations and the parser registry.
 pub mod parsers;
+/// Open SQLCipher evidence using an already recovered raw database key.
+pub use formats::sqlite::sqlcipher;
 
 use crate::parsers::ParserRegistry;
 use anyhow::Result;
