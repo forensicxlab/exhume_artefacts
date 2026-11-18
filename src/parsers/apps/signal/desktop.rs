@@ -20,14 +20,20 @@
 //!
 //! Messages are normalised into the canonical `chat.v1` envelope, the same shape
 //! the WhatsApp and iMessage parsers emit, so one view serves every chat app.
+//!
+//! Outgoing receipt flags stay unknown when the owner's conversation cannot be
+//! identified. Malformed JSON produces a row-specific `RecordParse` issue while
+//! available columns and table-backed attachments remain recoverable. Both
+//! diagnostic entry points forward these issues; `run_into` writes them as JSONL
+//! to stderr. Diagnostic-handler and stderr-write failures abort parsing.
 
 use crate::core::records::{
     AppInfo, Attachment, ChatMessage, Conversation, Direction, MessageState, Party,
 };
 use crate::core::{
     CompanionSpec, ObjectParsed, Parser, ParserContext, ParserInput, ParserInputError, ParserIssue,
-    ParserOptionDefault, ParserOptionSpec, ParserOptionType, ParserOptionValue, ParserOptions,
-    TimelineEvent,
+    ParserIssueCode, ParserOptionDefault, ParserOptionSpec, ParserOptionType, ParserOptionValue,
+    ParserOptions, TimelineEvent,
 };
 use crate::formats::sqlite::sqlcipher::{SqlCipherError, SqlCipherKey, SqlCipherProfile};
 use crate::formats::sqlite::{
@@ -331,6 +337,43 @@ impl Store<'_> {
         source["cipher_profile"] = json!(self.cipher);
         source
     }
+
+    /// Decode an optional JSON column without hiding a damaged source record.
+    /// Only locations and error categories are reported, never the JSON content.
+    fn parse_json(
+        &self,
+        table: &str,
+        id: Option<&str>,
+        rowid: Option<i64>,
+        text: Option<String>,
+        diagnostic: &mut dyn FnMut(ParserIssue) -> Result<()>,
+    ) -> Result<Value> {
+        let Some(text) = text else {
+            return Ok(Value::Null);
+        };
+        match serde_json::from_str(&text) {
+            Ok(value) => Ok(value),
+            Err(error) => {
+                let location = match rowid {
+                    Some(rowid) => format!("rowid {rowid}"),
+                    None => format!("id {:?}", id.unwrap_or("<unknown>")),
+                };
+                diagnostic(ParserIssue {
+                    code: ParserIssueCode::RecordParse,
+                    unit: rowid.and_then(|rowid| u64::try_from(rowid).ok()),
+                    message: format!(
+                        "{}: malformed {table}.json at {location} ({:?} at line {}, column {}); \
+                         JSON-only fields may be incomplete",
+                        self.evidence.source_label(),
+                        error.classify(),
+                        error.line(),
+                        error.column(),
+                    ),
+                })?;
+                Ok(Value::Null)
+            }
+        }
+    }
 }
 
 /// What an attachment record repeats about the message it belongs to.
@@ -414,7 +457,24 @@ impl Parser for SignalDesktopParser {
         input: ParserInput,
         sink: &mut dyn FnMut(ObjectParsed) -> Result<()>,
     ) -> Result<()> {
-        crate::run_parser_with_options(self, input, ParserOptions::default(), sink, &mut |_| Ok(()))
+        self.run_into_with_diagnostics(input, sink, &mut |issue| {
+            use std::io::Write;
+            writeln!(
+                std::io::stderr().lock(),
+                "{}",
+                serde_json::to_string(&issue)?
+            )?;
+            Ok(())
+        })
+    }
+
+    fn run_into_with_diagnostics(
+        &self,
+        input: ParserInput,
+        sink: &mut dyn FnMut(ObjectParsed) -> Result<()>,
+        diagnostic: &mut dyn FnMut(ParserIssue) -> Result<()>,
+    ) -> Result<()> {
+        crate::run_parser_with_options(self, input, ParserOptions::default(), sink, diagnostic)
     }
 
     fn run_into_with_context(
@@ -422,7 +482,7 @@ impl Parser for SignalDesktopParser {
         input: ParserInput,
         context: &ParserContext,
         sink: &mut dyn FnMut(ObjectParsed) -> Result<()>,
-        _diagnostic: &mut dyn FnMut(ParserIssue) -> Result<()>,
+        diagnostic: &mut dyn FnMut(ParserIssue) -> Result<()>,
     ) -> Result<()> {
         if context.parser_name() != PARSER_NAME {
             return Err(ParserInputError::invalid("context", "parser context mismatch").into());
@@ -455,12 +515,12 @@ impl Parser for SignalDesktopParser {
             }
         }
 
-        let directory = load_directory(&conn, &schema)?;
-        let edits = load_edit_read_status(&conn, &schema)?;
         let store = Store {
             evidence: &evidence,
             cipher,
         };
+        let directory = load_directory(&conn, &schema, &store, diagnostic)?;
+        let edits = load_edit_read_status(&conn, &schema)?;
 
         // Compiled once before the first record: a table this query cannot
         // read must not surface after the conversations are out.
@@ -468,7 +528,7 @@ impl Parser for SignalDesktopParser {
             .context("cannot read the messages of this database")?;
 
         emit_conversations(&directory, &store, sink)?;
-        emit_messages(&conn, &schema, &store, &directory, &edits, sink)
+        emit_messages(&conn, &schema, &store, &directory, &edits, sink, diagnostic)
     }
 }
 
@@ -553,25 +613,35 @@ fn leading_bytes(path: &std::path::Path) -> Result<Leading> {
 
 /// `items` row `uuid_id` carries the device owner's service id (ACI), stored
 /// as `<aci>.<device id>`.
-fn device_owner_service_id(conn: &SqliteConnection, schema: &SqliteSchema) -> Option<String> {
-    if !schema.has_table("items") || !schema.has_column("items", "json") {
-        return None;
+fn device_owner_service_id(
+    conn: &SqliteConnection,
+    schema: &SqliteSchema,
+    store: &Store,
+    diagnostic: &mut dyn FnMut(ParserIssue) -> Result<()>,
+) -> Result<Option<String>> {
+    if !schema.missing_columns("items", &["id", "json"]).is_empty() {
+        return Ok(None);
     }
     let mut owner = None;
-    // A missing or malformed row only means the owner stays unidentified.
-    let _ = conn.query_rows("SELECT json FROM items WHERE id = 'uuid_id';", |row| {
-        if let Some(text) = row.text(0)
-            && let Ok(value) = serde_json::from_str::<Value>(&text)
-            && let Some(id) = value["value"].as_str()
-        {
+    // The item key identifies the source even in an items table WITHOUT ROWID.
+    // Missing/malformed identity leaves the owner unknown; operational and
+    // diagnostic-handler failures still propagate.
+    conn.query_rows("SELECT json FROM items WHERE id = 'uuid_id';", |row| {
+        let value = store.parse_json("items", Some("uuid_id"), None, row.text(0), diagnostic)?;
+        if let Some(id) = value["value"].as_str() {
             owner = id.split('.').next().map(str::to_owned);
         }
         Ok(())
-    });
-    owner.filter(|id| !id.is_empty())
+    })?;
+    Ok(owner.filter(|id| !id.is_empty()))
 }
 
-fn load_directory(conn: &SqliteConnection, schema: &SqliteSchema) -> Result<Directory> {
+fn load_directory(
+    conn: &SqliteConnection,
+    schema: &SqliteSchema,
+    store: &Store,
+    diagnostic: &mut dyn FnMut(ParserIssue) -> Result<()>,
+) -> Result<Directory> {
     const T: &str = "conversations";
     let column = |name: &str, alias: &str| select_column(schema, T, "c", name, alias);
     let sql = format!(
@@ -590,16 +660,17 @@ fn load_directory(conn: &SqliteConnection, schema: &SqliteSchema) -> Result<Dire
         column("profileFullName", "profile_full_name"),
     );
 
-    let me = device_owner_service_id(conn, schema);
+    let me = device_owner_service_id(conn, schema, store, diagnostic)?;
     let mut conversations = BTreeMap::new();
     let mut names = HashMap::new();
     let mut own_conversation = None;
 
     conn.query_rows(&sql, |row| {
-        let Some(id) = row.text(1) else {
+        let id = row.text(1);
+        let blob = store.parse_json(T, id.as_deref(), row.i64(0), row.text(2), diagnostic)?;
+        let Some(id) = id else {
             return Ok(());
         };
-        let blob = parse_json(row.text(2));
         let text_of = |key: &str| non_empty(blob[key].as_str().map(str::to_owned));
 
         let service_id = non_empty(row.text(4))
@@ -950,6 +1021,7 @@ fn emit_messages(
     directory: &Directory,
     edits: &EditReadStatus,
     sink: &mut dyn FnMut(ObjectParsed) -> Result<()>,
+    diagnostic: &mut dyn FnMut(ParserIssue) -> Result<()>,
 ) -> Result<()> {
     let has_join = attachment_join(schema).is_some();
     let sql = message_query(schema);
@@ -963,7 +1035,15 @@ fn emit_messages(
             .is_none_or(|(message, _)| message.rowid != rowid)
         {
             if let Some((message, attachments)) = pending.take() {
-                emit_message(store, directory, edits, message, attachments, sink)?;
+                emit_message(
+                    store,
+                    directory,
+                    edits,
+                    message,
+                    attachments,
+                    sink,
+                    diagnostic,
+                )?;
             }
             let message_type = row.text(2).unwrap_or_default();
             if !CHAT_TYPES.contains(&message_type.as_str()) {
@@ -1003,9 +1083,15 @@ fn emit_messages(
         Ok(())
     })?;
     match pending {
-        Some((message, attachments)) => {
-            emit_message(store, directory, edits, message, attachments, sink)
-        }
+        Some((message, attachments)) => emit_message(
+            store,
+            directory,
+            edits,
+            message,
+            attachments,
+            sink,
+            diagnostic,
+        ),
         None => Ok(()),
     }
 }
@@ -1018,13 +1104,14 @@ fn emit_message(
     row: MessageRow,
     mut table_attachments: Vec<SignalAttachment>,
     sink: &mut dyn FnMut(ObjectParsed) -> Result<()>,
+    diagnostic: &mut dyn FnMut(ParserIssue) -> Result<()>,
 ) -> Result<()> {
     const T: &str = "messages";
     let message_type = row.message_type;
     let rowid = row.rowid;
     let message_id = row.id;
     let conversation_id = row.conversation_id;
-    let blob = parse_json(row.json);
+    let blob = store.parse_json(T, message_id.as_deref(), rowid, row.json, diagnostic)?;
     let text_of = |key: &str| blob[key].as_str().map(str::to_owned);
 
     let unknown_conversation = ConvInfo::default();
@@ -1387,16 +1474,19 @@ fn structured_text(blob: &Value) -> Option<String> {
 /// devices, so it never counts for another recipient: it is read only when it
 /// is the sole entry of the map (Note to Self), the rule of Signal's
 /// `isMessageJustForMe`.
+/// Without an identified owner, no entry can safely be classified as a
+/// recipient receipt instead of linked-device synchronisation.
 fn outgoing_state(states: &Value, own_conversation: Option<&str>) -> (Option<bool>, Option<bool>) {
+    let Some(own_conversation) = own_conversation else {
+        return (None, None);
+    };
     let Some(states) = states.as_object() else {
         return (None, None);
     };
     let just_for_owner = states.len() == 1;
     let statuses: Vec<&str> = states
         .iter()
-        .filter(|(conversation, _)| {
-            just_for_owner || Some(conversation.as_str()) != own_conversation
-        })
+        .filter(|(conversation, _)| just_for_owner || conversation.as_str() != own_conversation)
         .filter_map(|(_, state)| state["status"].as_str())
         .collect();
     if statuses.is_empty() {
@@ -1451,11 +1541,6 @@ fn edit_history(blob: &Value) -> Vec<Value> {
         .unwrap_or_default()
 }
 
-fn parse_json(text: Option<String>) -> Value {
-    text.and_then(|text| serde_json::from_str(&text).ok())
-        .unwrap_or(Value::Null)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1477,6 +1562,49 @@ mod tests {
             Ok(())
         })?;
         Ok(objects)
+    }
+
+    fn invoke_with_diagnostics(
+        input: ParserInput,
+        with_context: bool,
+        sink: &mut dyn FnMut(ObjectParsed) -> Result<()>,
+        diagnostic: &mut dyn FnMut(ParserIssue) -> Result<()>,
+    ) -> Result<()> {
+        if with_context {
+            crate::run_parser_with_options(
+                &SignalDesktopParser,
+                input,
+                ParserOptions::default(),
+                sink,
+                diagnostic,
+            )
+        } else {
+            SignalDesktopParser.run_into_with_diagnostics(input, sink, diagnostic)
+        }
+    }
+
+    fn parse_with_issues(
+        sql: &str,
+        with_context: bool,
+    ) -> Result<(Vec<ObjectParsed>, Vec<ParserIssue>)> {
+        let tmp = tempfile::tempdir()?;
+        let db = tmp.path().join("db.sqlite");
+        SqliteConnection::create_for_test(&db)?.execute_batch(sql)?;
+        let mut objects = Vec::new();
+        let mut issues = Vec::new();
+        invoke_with_diagnostics(
+            ParserInput::Path(db),
+            with_context,
+            &mut |object| {
+                objects.push(object);
+                Ok(())
+            },
+            &mut |issue| {
+                issues.push(issue);
+                Ok(())
+            },
+        )?;
+        Ok((objects, issues))
     }
 
     fn options(key: Option<&[u8]>, cipher_version: Option<i64>) -> ParserOptions {
@@ -1884,6 +2012,201 @@ mod tests {
         );
         assert_eq!(state(r#"{}"#), (None, None));
         assert_eq!(state(r#"[]"#), (None, None));
+    }
+
+    #[test]
+    fn outgoing_receipts_stay_unknown_when_the_owner_is_unidentified() -> Result<()> {
+        for change in [
+            "DELETE FROM items WHERE id = 'uuid_id';",
+            "UPDATE items SET json = '{' WHERE id = 'uuid_id';",
+            r#"UPDATE items SET json = '{"value":17}' WHERE id = 'uuid_id';"#,
+            r#"UPDATE items SET json = '{"value":""}' WHERE id = 'uuid_id';"#,
+            r#"UPDATE items SET json = '{"value":"unmatched.2"}' WHERE id = 'uuid_id';"#,
+            "DELETE FROM conversations WHERE id = 'c-me';",
+            "DROP TABLE items;",
+        ] {
+            let objects = parse(&format!("{}\n{change}", current_schema()))?;
+            for id in ["m4", "m6", "m17"] {
+                let object = message(&objects, id);
+                assert!(object["state"]["read"].is_null(), "{change}: {id}");
+                assert!(object["state"]["delivered"].is_null(), "{change}: {id}");
+            }
+            // The raw map remains available even when interpretation is uncertain.
+            assert_eq!(
+                message(&objects, "m4")["details"]["send_state_by_conversation_id"]["c-me"]["status"],
+                "Read"
+            );
+            assert_eq!(message(&objects, "m1")["state"]["read"], true);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_json_reports_source_rows_in_both_diagnostic_paths() -> Result<()> {
+        let sql = format!(
+            r#"{}
+            UPDATE items SET json = '{{"value":' WHERE id = 'uuid_id';
+            UPDATE conversations SET json = '{{"name":' WHERE id = 'c-alice';
+            UPDATE messages SET json = '{{"quote":' WHERE id = 'm3';
+            INSERT INTO messages (rowid, id, type, conversationId, json, body,
+                sent_at, sourceServiceId, readStatus) VALUES
+                (90, 'damaged', 'incoming', 'c-alice', '{{"private-json-marker":',
+                 'recoverable body', {T0} + 90000, '{ALICE}', 1);
+            INSERT INTO message_attachments (messageId, editHistoryIndex, attachmentType,
+                orderInMessage, size, contentType, path) VALUES
+                ('damaged', -1, 'attachment', 0, 3, 'image/png', 'aa/first'),
+                ('damaged', -1, 'attachment', 1, 4, 'text/plain', 'bb/second');"#,
+            current_schema()
+        );
+        for with_context in [false, true] {
+            let (objects, issues) = parse_with_issues(&sql, with_context)?;
+            assert_eq!(messages(&objects).len(), 18);
+            assert_eq!(issues.len(), 4);
+            let source = objects[0].json["source"]["path"].as_str().unwrap();
+            for (issue, (table, unit, location)) in issues.iter().zip([
+                ("items", None, "id \"uuid_id\""),
+                ("conversations", Some(2), "rowid 2"),
+                ("messages", Some(3), "rowid 3"),
+                ("messages", Some(90), "rowid 90"),
+            ]) {
+                assert!(matches!(
+                    issue.code,
+                    crate::core::ParserIssueCode::RecordParse
+                ));
+                assert_eq!(issue.unit, unit);
+                assert!(issue.message.contains(source));
+                assert!(issue.message.contains(&format!("{table}.json")));
+                assert!(issue.message.contains(location));
+                assert!(!issue.message.contains("private-json-marker"));
+                assert!(!issue.message.contains("recoverable body"));
+            }
+            let object = message(&objects, "damaged");
+            assert_eq!(object["body"], "recoverable body");
+            assert_eq!(object["sender"]["id"], ALICE);
+            assert_eq!(object["conversation"]["display_name"], "Alice Smith");
+            assert_eq!(object["timestamps"]["message"]["unix_ms"], T0 + 90000);
+            assert_eq!(object["state"]["read"], false);
+            assert_eq!(object["attachments"].as_array().unwrap().len(), 2);
+            let attachments: Vec<_> = of_kind(&objects, "mobile.communication.attachment")
+                .into_iter()
+                .filter(|object| object.json["message"]["id"] == "damaged")
+                .map(|object| object.json["media"]["local_path"].clone())
+                .collect();
+            assert_eq!(attachments, ["aa/first", "bb/second"]);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn absent_and_json_null_values_do_not_report_decoding_failures() -> Result<()> {
+        let sql = format!(
+            "{}\nUPDATE items SET json = NULL;
+             UPDATE conversations SET json = NULL WHERE id = 'c-bob';
+             UPDATE conversations SET json = 'null' WHERE id = 'c-carol';
+             UPDATE messages SET json = NULL WHERE id = 'm1';
+             UPDATE messages SET json = 'null' WHERE id = 'm2';",
+            current_schema()
+        );
+        for with_context in [false, true] {
+            let (objects, issues) = parse_with_issues(&sql, with_context)?;
+            assert_eq!(messages(&objects).len(), 17);
+            assert!(issues.is_empty());
+            assert_eq!(message(&objects, "m1")["body"], "hi");
+            assert_eq!(message(&objects, "m2")["body"], "unread one");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn owner_items_without_rowid_preserve_identity_and_diagnostics() -> Result<()> {
+        let sql = format!(
+            "{}\nALTER TABLE items RENAME TO old_items;
+             CREATE TABLE items (id TEXT PRIMARY KEY, json TEXT) WITHOUT ROWID;
+             INSERT INTO items SELECT id, json FROM old_items;
+             DROP TABLE old_items;",
+            current_schema()
+        );
+        for with_context in [false, true] {
+            let (objects, issues) = parse_with_issues(&sql, with_context)?;
+            assert!(issues.is_empty());
+            assert_eq!(message(&objects, "m4")["state"]["delivered"], true);
+            assert!(message(&objects, "m4")["state"]["read"].is_null());
+            assert_eq!(message(&objects, "m17")["state"]["read"], true);
+
+            let (objects, issues) = parse_with_issues(
+                &format!("{sql}\nUPDATE items SET json = '{{' WHERE id = 'uuid_id';"),
+                with_context,
+            )?;
+            assert_eq!(issues.len(), 1);
+            assert_eq!(issues[0].unit, None);
+            assert!(issues[0].message.contains("items.json at id \"uuid_id\""));
+            assert!(message(&objects, "m4")["state"]["read"].is_null());
+            assert!(message(&objects, "m4")["state"]["delivered"].is_null());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn negative_rowids_are_preserved_without_wrapping_diagnostic_units() -> Result<()> {
+        let sql = format!(
+            "{}\nUPDATE messages SET rowid = -4, json = '{{' WHERE id = 'm4';",
+            current_schema()
+        );
+        for with_context in [false, true] {
+            let (objects, issues) = parse_with_issues(&sql, with_context)?;
+            assert_eq!(issues.len(), 1);
+            assert_eq!(issues[0].unit, None);
+            assert!(issues[0].message.contains("rowid -4"));
+            let object = message(&objects, "m4");
+            assert_eq!(object["source"]["rowid"], -4);
+            assert_eq!(object["body"], "yo");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn diagnostic_handler_failures_abort_both_paths_at_the_source_row() -> Result<()> {
+        for with_context in [false, true] {
+            for (table, predicate) in [
+                ("items", "id = 'uuid_id'"),
+                ("conversations", "id = 'c-alice'"),
+                ("messages", "id = 'm3'"),
+            ] {
+                let tmp = tempfile::tempdir()?;
+                let db = tmp.path().join("db.sqlite");
+                SqliteConnection::create_for_test(&db)?.execute_batch(&format!(
+                    "{}\nUPDATE {table} SET json = '{{' WHERE {predicate};",
+                    current_schema()
+                ))?;
+                let mut objects = Vec::new();
+                let mut issues = 0;
+                let error = invoke_with_diagnostics(
+                    ParserInput::Path(db),
+                    with_context,
+                    &mut |object| {
+                        objects.push(object);
+                        Ok(())
+                    },
+                    &mut |_| {
+                        issues += 1;
+                        anyhow::bail!("diagnostic handler stopped")
+                    },
+                )
+                .unwrap_err();
+                assert_eq!(error.root_cause().to_string(), "diagnostic handler stopped");
+                assert_eq!(issues, 1);
+                if table == "messages" {
+                    assert!(
+                        messages(&objects)
+                            .iter()
+                            .all(|m| m.json["source"]["id"] != "m3")
+                    );
+                } else {
+                    assert!(objects.is_empty());
+                }
+            }
+        }
+        Ok(())
     }
 
     #[test]
