@@ -1,6 +1,6 @@
 //! Parser registration. Identifiers are independent of Rust module paths.
 
-use super::{android, ios, macos, windows};
+use super::{android, apps, ios, macos, windows};
 use crate::core::Parser;
 use std::{collections::HashMap, sync::Arc};
 
@@ -207,6 +207,11 @@ pub fn build_registry() -> ParserRegistry {
     m.insert(
         "macos_container_registration",
         Arc::new(macos::MacosContainerRegistrationParser) as Arc<dyn Parser>,
+    );
+
+    m.insert(
+        "desktop_signal",
+        Arc::new(apps::signal::SignalDesktopParser) as Arc<dyn Parser>,
     );
 
     m

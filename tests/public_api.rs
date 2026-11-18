@@ -59,6 +59,7 @@ fn registry_retains_identifiers_used_by_cli_and_indexer_rules() {
     assert_eq!(
         names,
         [
+            "desktop_signal",
             "macos_app_bundle",
             "macos_chromium",
             "macos_container_registration",
