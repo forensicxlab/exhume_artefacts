@@ -10,6 +10,11 @@ pub fn build_registry() -> ParserRegistry {
     let mut m: ParserRegistry = HashMap::new();
 
     m.insert(
+        "windows_dpapi_masterkey",
+        Arc::new(windows::WindowsDpapiMasterKeyParser) as Arc<dyn Parser>,
+    );
+
+    m.insert(
         "windows_evtx",
         Arc::new(windows::WindowsEvtxParser::default()) as Arc<dyn Parser>,
     );

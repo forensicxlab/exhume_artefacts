@@ -10,7 +10,7 @@ use crate::core::{ParserInput, ParserSource};
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 use std::fs;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 
 /// One source file described in a parser's provenance block.
 #[derive(Debug, Clone)]
@@ -52,6 +52,56 @@ pub(crate) struct FileEvidence {
 }
 
 impl FileEvidence {
+    /// Read only the primary input with an enforced byte limit, including
+    /// provider-backed inputs whose length is not known before copying.
+    pub(crate) fn read_primary_bounded(input: ParserInput, maximum: usize) -> Result<Self> {
+        let (bytes, source_label, source_files) = match input {
+            ParserInput::Path(path) => {
+                let label = path.display().to_string();
+                let mut file =
+                    fs::File::open(&path).with_context(|| format!("failed to open {label}"))?;
+                let bytes = bounded_read(&mut file, maximum)?;
+                (bytes, label.clone(), vec![FileRef::primary(label)])
+            }
+            ParserInput::Bytes(bytes) => {
+                if bytes.len() > maximum {
+                    anyhow::bail!("primary input exceeds {maximum} bytes");
+                }
+                (
+                    bytes,
+                    "<in-memory>".to_string(),
+                    vec![FileRef::primary("<in-memory>".to_string())],
+                )
+            }
+            ParserInput::ReadSeek(mut reader) => {
+                reader.seek(SeekFrom::Start(0))?;
+                let bytes = bounded_read(&mut reader, maximum)?;
+                (
+                    bytes,
+                    "<stream>".to_string(),
+                    vec![FileRef::primary("<stream>".to_string())],
+                )
+            }
+            ParserInput::Compound(mut compound) => {
+                let mut writer = LimitedBytes {
+                    bytes: Vec::new(),
+                    maximum,
+                };
+                compound
+                    .provider
+                    .copy_to(&compound.primary, &mut writer)
+                    .context("failed to read bounded primary compound input")?;
+                let files = vec![FileRef::from_source(&compound.primary)];
+                (writer.bytes, compound.primary.original_path, files)
+            }
+        };
+        Ok(Self {
+            bytes,
+            source_label,
+            source_files,
+        })
+    }
+
     pub(crate) fn read_primary(input: ParserInput) -> Result<Self> {
         match input {
             ParserInput::Path(path) => {
@@ -124,5 +174,42 @@ impl FileEvidence {
             "parser_confidence": "compatible_schema",
             "files": self.source_files_json(),
         })
+    }
+}
+
+fn bounded_read(reader: &mut dyn Read, maximum: usize) -> Result<Vec<u8>> {
+    let limit = u64::try_from(maximum)?
+        .checked_add(1)
+        .context("input limit overflow")?;
+    let mut bytes = Vec::new();
+    reader.take(limit).read_to_end(&mut bytes)?;
+    if bytes.len() > maximum {
+        anyhow::bail!("primary input exceeds {maximum} bytes");
+    }
+    Ok(bytes)
+}
+
+struct LimitedBytes {
+    bytes: Vec<u8>,
+    maximum: usize,
+}
+impl Write for LimitedBytes {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        if self
+            .bytes
+            .len()
+            .checked_add(buffer.len())
+            .is_none_or(|length| length > self.maximum)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "primary input exceeds parser byte limit",
+            ));
+        }
+        self.bytes.extend_from_slice(buffer);
+        Ok(buffer.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
     }
 }

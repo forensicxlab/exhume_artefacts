@@ -95,6 +95,7 @@ fn registry_retains_identifiers_used_by_cli_and_indexer_rules() {
             "mobile_ios_safari",
             "mobile_ios_tcc",
             "mobile_ios_whatsapp",
+            "windows_dpapi_masterkey",
             "windows_evtx",
             "windows_pe",
             "windows_pml",
