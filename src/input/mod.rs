@@ -60,6 +60,7 @@ fn local_candidate(primary: &Path, rule: CompanionPathRule) -> PathBuf {
             path.into()
         }
         CompanionPathRule::Sibling(name) => primary.with_file_name(name),
+        CompanionPathRule::Extension(extension) => primary.with_extension(extension),
     }
 }
 
@@ -92,7 +93,7 @@ impl ParserFileProvider for LocalFileProvider {
 }
 
 /// Explicit companions override discovery by role. Unspecified companions use
-/// the parser's suffix/sibling rules. Only NotFound is ignored for optional
+/// the parser's suffix/sibling/extension rules. Only NotFound is ignored for optional
 /// discovered files; an explicit missing path or any other IO error fails.
 pub fn local_input(
     parser: &dyn Parser,

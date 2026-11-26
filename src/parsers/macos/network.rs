@@ -459,14 +459,14 @@ fn is_wifi_configuration(dict: &Dictionary) -> bool {
         "PrivateMACAddressModeSystemSetting",
     ]
     .iter()
-    .any(|key| dict.contains_key(*key))
+    .any(|key| dict.contains_key(key))
         || dict.keys().any(|key| key.starts_with("wifi.network."))
 }
 
 fn has_ssid_key(dict: &Dictionary) -> bool {
     ["SSID_STR", "SSIDString", "SSID"]
         .iter()
-        .any(|key| dict.contains_key(*key))
+        .any(|key| dict.contains_key(key))
 }
 
 fn child_dict<'a>(dict: &'a Dictionary, key: &str) -> Option<&'a Dictionary> {
@@ -502,19 +502,19 @@ fn bool_value(value: Option<&Plist>) -> Option<bool> {
 }
 
 fn first_text(dict: &Dictionary, keys: &[&str]) -> Option<String> {
-    keys.iter().find_map(|key| text(dict.get(*key)))
+    keys.iter().find_map(|key| text(dict.get(key)))
 }
 
 fn first_integer(dict: &Dictionary, keys: &[&str]) -> Option<i64> {
-    keys.iter().find_map(|key| integer_value(dict.get(*key)))
+    keys.iter().find_map(|key| integer_value(dict.get(key)))
 }
 
 fn first_bool(dict: &Dictionary, keys: &[&str]) -> Option<bool> {
-    keys.iter().find_map(|key| bool_value(dict.get(*key)))
+    keys.iter().find_map(|key| bool_value(dict.get(key)))
 }
 
 fn first_mac(dict: &Dictionary, keys: &[&str]) -> Option<String> {
-    keys.iter().find_map(|key| mac_address(dict.get(*key)))
+    keys.iter().find_map(|key| mac_address(dict.get(key)))
 }
 
 fn mac_address(value: Option<&Plist>) -> Option<String> {
@@ -562,14 +562,14 @@ fn value_array(value: Option<&Plist>) -> Value {
 
 fn first_string_array(dict: &Dictionary, keys: &[&str]) -> Value {
     keys.iter()
-        .map(|key| string_array(dict.get(*key)))
+        .map(|key| string_array(dict.get(key)))
         .find(|value| !value.is_null())
         .unwrap_or(Value::Null)
 }
 
 fn first_data_summary(dict: &Dictionary, keys: &[&str]) -> Value {
     for key in keys {
-        match dict.get(*key) {
+        match dict.get(key) {
             Some(Plist::Data(bytes)) => {
                 return json!({ "hex": hex::encode(bytes), "length": bytes.len() });
             }
@@ -586,7 +586,7 @@ fn first_data_summary(dict: &Dictionary, keys: &[&str]) -> Value {
 
 fn first_timestamp(dict: &Dictionary, keys: &[&str]) -> Value {
     keys.iter()
-        .map(|key| plist_timestamp(dict.get(*key)))
+        .map(|key| plist_timestamp(dict.get(key)))
         .find(|value| !value.is_null())
         .unwrap_or(Value::Null)
 }

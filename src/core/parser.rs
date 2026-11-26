@@ -30,6 +30,22 @@ pub trait Parser: Send + Sync {
         &[]
     }
 
+    /// Describe a referenced asset using this parser's format rules. The caller
+    /// resolves acquired evidence and chooses a derived-output directory.
+    fn attachment_recipe(
+        &self,
+        _record: &serde_json::Value,
+        _rendition: crate::assets::Rendition,
+    ) -> crate::assets::Result<Option<Box<dyn crate::assets::AssetRecipe>>> {
+        Ok(None)
+    }
+
+    /// Infer the application asset root from its primary evidence path. Used
+    /// for declared asset bases and standalone CLI recovery.
+    fn asset_root(&self, _primary_path: &std::path::Path) -> Option<std::path::PathBuf> {
+        None
+    }
+
     /// Context-aware entry point. Call `run_parser_with_options` to validate
     /// user settings first. Existing implementations keep their diagnostics.
     /// Parsers declaring settings must override this method to consume them.

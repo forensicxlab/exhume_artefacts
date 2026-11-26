@@ -1,6 +1,6 @@
 //! Parser registration. Identifiers are independent of Rust module paths.
 
-use super::{android, apps, ios, macos, windows};
+use super::{android, apps, ios, linux, macos, windows};
 use crate::core::Parser;
 use std::{collections::HashMap, sync::Arc};
 
@@ -8,6 +8,16 @@ pub type ParserRegistry = HashMap<&'static str, Arc<dyn Parser>>;
 
 pub fn build_registry() -> ParserRegistry {
     let mut m: ParserRegistry = HashMap::new();
+
+    m.insert(
+        "linux_kwallet",
+        Arc::new(linux::kwallet::KWalletParser) as Arc<dyn Parser>,
+    );
+
+    m.insert(
+        "linux_gnome_keyring",
+        Arc::new(linux::gnome_keyring::GnomeKeyringParser) as Arc<dyn Parser>,
+    );
 
     m.insert(
         "windows_dpapi_masterkey",
@@ -21,7 +31,7 @@ pub fn build_registry() -> ParserRegistry {
 
     m.insert(
         "windows_pe",
-        Arc::new(windows::WindowsPeParser::default()) as Arc<dyn Parser>,
+        Arc::new(windows::WindowsPeParser) as Arc<dyn Parser>,
     );
 
     m.insert(

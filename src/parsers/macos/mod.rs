@@ -30,3 +30,6 @@ pub use safari::MacosSafariParser;
 pub use sharedfilelist::MacosSharedFileListParser;
 pub use spotlight::MacosSpotlightParser;
 pub use whatsapp::MacosWhatsAppParser;
+
+#[cfg(test)]
+mod tests;

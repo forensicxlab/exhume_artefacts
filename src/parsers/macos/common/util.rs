@@ -2,13 +2,7 @@
 
 /// Return `None` for `None` or all-whitespace strings, otherwise the original.
 pub(crate) fn non_empty(value: Option<String>) -> Option<String> {
-    value.and_then(|value| {
-        if value.trim().is_empty() {
-            None
-        } else {
-            Some(value)
-        }
-    })
+    value.filter(|value| !value.trim().is_empty())
 }
 
 /// Extract the host portion of a URL without pulling in a URL-parsing crate.

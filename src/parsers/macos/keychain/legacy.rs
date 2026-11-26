@@ -1,301 +1,214 @@
-//! Legacy `login.keychain-db` / `System.keychain` (CSSM `AppleDatabase`, magic
-//! `kych`) metadata extraction.
-//!
-//! Layout (all integers big-endian), verified against `security dump-keychain`:
-//! - Header: `kych`, version, header size, **schema offset** at byte 12.
-//! - Schema (at schema offset): size, table count, then `table_count`
-//!   `u32` table offsets relative to the schema offset.
-//! - Table (at schema_off + rel): size, **table id** (record type), **record
-//!   count**, then — from offset `0x1c` — an array of record offsets relative to
-//!   the table start (`0` marks a freed slot).
-//! - Record: header, then from offset `0x18` an attribute slot array. Each slot
-//!   is `target_offset | low_bits`; `slot & !3` is the value offset within the
-//!   record. String/blob attributes are `[u32 len][bytes]`; date attributes are
-//!   a fixed 16-byte `YYYYMMDDhhmmssZ` string. A `0` slot means the attribute is
-//!   absent. Secrets (`ssgp`-guarded `data`) are never decoded.
+//! File-based CSSM Keychain metadata. Structural validation and authentication
+//! belong to `formats::keychain`; this adapter emits no recovered secrets.
 
-use super::{KEYCHAIN_ITEM_KIND, PARSER_NAME};
-use crate::core::ObjectParsed;
-use crate::formats::sqlite::SqliteEvidence;
-use crate::formats::sqlite::sqlite_source_json;
-use anyhow::{Result, bail};
+use super::{Authentication, KEYCHAIN_ITEM_KIND, PARSER_NAME};
+use crate::core::{ObjectParsed, ParserIssue, ParserIssueCode};
+use crate::formats::keychain::LegacyKeychain;
+use crate::formats::keychain::database::{GENERIC_HEADER_BYTES, Record};
+use crate::formats::sqlite::{SqliteEvidence, sqlite_source_json};
+use anyhow::{Context, Result};
 use chrono::{TimeZone, Utc};
 use serde_json::{Value, json};
 
 const SCHEMA_VARIANT: &str = "macos_legacy_keychain_cssm_v1";
-
-// CSSM record type (table id) constants.
 const RECORD_GENERIC_PASSWORD: u32 = 0x8000_0000;
 const RECORD_INTERNET_PASSWORD: u32 = 0x8000_0001;
 const RECORD_APPLESHARE_PASSWORD: u32 = 0x8000_0002;
-const RECORD_X509_CERTIFICATE: u32 = 0x8000_8000;
+// 0x80008000 is database protection metadata, not a certificate table.
+const RECORD_X509_CERTIFICATE: u32 = 0x8000_1000;
 const RECORD_PUBLIC_KEY: u32 = 0x0000_000F;
 const RECORD_PRIVATE_KEY: u32 = 0x0000_0010;
 const RECORD_SYMMETRIC_KEY: u32 = 0x0000_0011;
 
 pub(crate) fn parse(
-    data: &[u8],
+    file: &LegacyKeychain<'_>,
     evidence: &SqliteEvidence,
+    authentication: Authentication,
     sink: &mut dyn FnMut(ObjectParsed) -> Result<()>,
+    diagnostic: &mut dyn FnMut(ParserIssue) -> Result<()>,
 ) -> Result<()> {
-    if data.len() < 24 || &data[0..4] != b"kych" {
-        bail!("not a legacy CSSM keychain (bad magic)");
-    }
-    let schema_off = be(data, 12)? as usize;
-    let table_count = be(data, schema_off + 4)? as usize;
-
     let mut index = 0i64;
-    for t in 0..table_count {
-        let rel = be(data, schema_off + 8 + 4 * t)? as usize;
-        let base = schema_off + rel;
-        let table_id = be(data, base + 4)?;
-        let record_count = be(data, base + 8)? as usize;
-        let record_offsets = collect_record_offsets(data, base, record_count);
-
-        match table_id {
-            RECORD_GENERIC_PASSWORD => {
-                for &off in &record_offsets {
-                    emit_password(
-                        data,
-                        base + off,
-                        evidence,
-                        "generic_password",
-                        &GENERIC,
-                        &mut index,
-                        sink,
-                    )?;
+    for table in &file.tables {
+        let password_layout = match table.id {
+            RECORD_GENERIC_PASSWORD => Some(("generic_password", &GENERIC)),
+            RECORD_INTERNET_PASSWORD => Some(("internet_password", &INTERNET)),
+            RECORD_APPLESHARE_PASSWORD => Some(("internet_password", &APPLESHARE)),
+            _ => None,
+        };
+        if let Some((class, layout)) = password_layout {
+            for record in &table.records {
+                match password_object(record, evidence, class, layout, index, authentication) {
+                    Ok(object) => sink(object)?,
+                    Err(error) => diagnostic(ParserIssue {
+                        code: ParserIssueCode::RecordParse,
+                        unit: Some(record.section.offset as u64),
+                        message: format!(
+                            "{}: CSSM table {:#x}, record {}, byte {}: {error:#}",
+                            evidence.source_label(),
+                            table.id,
+                            record.number,
+                            record.section.offset
+                        ),
+                    })?,
                 }
-            }
-            RECORD_INTERNET_PASSWORD | RECORD_APPLESHARE_PASSWORD => {
-                for &off in &record_offsets {
-                    emit_password(
-                        data,
-                        base + off,
-                        evidence,
-                        "internet_password",
-                        &INTERNET,
-                        &mut index,
-                        sink,
-                    )?;
-                }
-            }
-            RECORD_X509_CERTIFICATE if record_count > 0 => {
-                emit_table_summary(evidence, "certificate", table_id, record_count, index, sink)?;
                 index += 1;
             }
-            RECORD_PUBLIC_KEY | RECORD_PRIVATE_KEY | RECORD_SYMMETRIC_KEY if record_count > 0 => {
-                let class = key_class(table_id);
-                emit_table_summary(evidence, class, table_id, record_count, index, sink)?;
-                index += 1;
-            }
-            _ => {}
+        } else if !table.records.is_empty() {
+            let class = match table.id {
+                RECORD_X509_CERTIFICATE => "certificate",
+                RECORD_PUBLIC_KEY => "public_key",
+                RECORD_PRIVATE_KEY => "private_key",
+                RECORD_SYMMETRIC_KEY => "symmetric_key",
+                _ => continue,
+            };
+            let mut source = sqlite_source_json(evidence, class, index, SCHEMA_VARIANT);
+            source["byte_offset"] = json!(table.offset);
+            sink(ObjectParsed {
+                parser: PARSER_NAME,
+                kind: KEYCHAIN_ITEM_KIND,
+                text: format!("{class}: {} record(s)", table.records.len()),
+                json: json!({
+                    "platform": "macos", "app": "keychain",
+                    "record_type": "keychain_table_summary", "format": "keychain-db", "class": class,
+                    "source": source,
+                    "summary": {"table_id": format!("0x{:08x}", table.id), "record_count": table.records.len()},
+                    "recovery": recovery_json(authentication),
+                }),
+            })?;
+            index += 1;
         }
     }
     Ok(())
 }
 
-/// Attribute slot indices for a password record class (mirrors the modern
-/// SQLite column order for the same class).
 struct PasswordLayout {
-    created: usize,
-    modified: usize,
-    description: usize,
-    comment: usize,
-    label: usize,
-    account: usize,
-    /// `svce` for generic passwords, `srvr` for internet passwords.
+    header_size: usize,
     service_or_server: usize,
-    /// Internet-only extras; ignored when `usize::MAX`.
     protocol: usize,
     path: usize,
     port: usize,
 }
-
 const GENERIC: PasswordLayout = PasswordLayout {
-    created: 0,
-    modified: 1,
-    description: 2,
-    comment: 3,
-    label: 7,
-    account: 13,
-    service_or_server: 14, // svce
+    header_size: GENERIC_HEADER_BYTES,
+    service_or_server: 14,
     protocol: usize::MAX,
     path: usize::MAX,
     port: usize::MAX,
 };
-
 const INTERNET: PasswordLayout = PasswordLayout {
-    created: 0,
-    modified: 1,
-    description: 2,
-    comment: 3,
-    label: 7,
-    account: 13,
-    service_or_server: 15, // srvr
+    header_size: 104,
+    service_or_server: 15,
     protocol: 16,
     path: 19,
     port: 18,
 };
+const APPLESHARE: PasswordLayout = PasswordLayout {
+    header_size: 104,
+    service_or_server: 15,
+    protocol: 16,
+    path: usize::MAX,
+    port: usize::MAX,
+};
 
-#[allow(clippy::too_many_arguments)]
-fn emit_password(
-    data: &[u8],
-    rec: usize,
+fn recovery_json(authentication: Authentication) -> Value {
+    let method = match authentication {
+        Authentication::NotAttempted => None,
+        Authentication::DirectPassword => Some("direct_password"),
+        Authentication::LoginPasswordProtectedEntropy => Some("login_password_protected_entropy"),
+    };
+    json!({"status": if method.is_some() { "database_keys_authenticated" } else { "not_attempted" }, "method": method, "scope": "database_blob_only", "item_payload_authenticated": false})
+}
+
+fn password_object(
+    record: &Record<'_>,
     evidence: &SqliteEvidence,
     class: &str,
     layout: &PasswordLayout,
-    index: &mut i64,
-    sink: &mut dyn FnMut(ObjectParsed) -> Result<()>,
-) -> Result<()> {
-    let account = string_attr(data, rec, layout.account);
-    let service = string_attr(data, rec, layout.service_or_server);
+    index: i64,
+    authentication: Authentication,
+) -> Result<ObjectParsed> {
+    record.data(layout.header_size)?;
+    let account = string_attr(record, layout, 13)?;
+    let service = string_attr(record, layout, layout.service_or_server)?;
     let text = service
         .clone()
         .or_else(|| account.clone())
         .unwrap_or_default();
-
     let mut item = json!({
         "account": account,
-        "label": string_attr(data, rec, layout.label),
-        "description": string_attr(data, rec, layout.description),
-        "comment": string_attr(data, rec, layout.comment),
+        "label": string_attr(record, layout, 7)?,
+        "description": string_attr(record, layout, 2)?,
+        "comment": string_attr(record, layout, 3)?,
     });
-    let obj = item.as_object_mut().unwrap();
     if class == "internet_password" {
-        obj.insert("server".to_string(), json_or_null(service.clone()));
-        obj.insert(
-            "protocol".to_string(),
-            json_or_null(string_attr(data, rec, layout.protocol)),
-        );
-        obj.insert(
-            "path".to_string(),
-            json_or_null(string_attr(data, rec, layout.path)),
-        );
-        obj.insert("port".to_string(), int_attr(data, rec, layout.port));
+        item["server"] = json!(service);
+        item["protocol"] = match record.value(layout.protocol, layout.header_size)? {
+            Some(value) => json!(
+                std::str::from_utf8(value.part(0, 4, "protocol code")?.bytes)
+                    .context("invalid protocol code")?
+            ),
+            None => Value::Null,
+        };
+        item["path"] = json!(string_attr(record, layout, layout.path)?);
+        item["port"] = if layout.port == usize::MAX {
+            Value::Null
+        } else {
+            match record.value(layout.port, layout.header_size)? {
+                Some(value) => json!(value.u32(0, "integer attribute")?),
+                None => Value::Null,
+            }
+        };
     } else {
-        obj.insert("service".to_string(), json_or_null(service));
+        item["service"] = json!(service);
     }
-
-    let json = json!({
-        "platform": "macos",
-        "app": "keychain",
-        "record_type": "keychain_item",
-        "format": "keychain-db",
-        "class": class,
-        "source": sqlite_source_json(evidence, class, *index, SCHEMA_VARIANT),
-        "timestamps": {
-            "created": cssm_time_to_json(date_attr(data, rec, layout.created)),
-            "modified": cssm_time_to_json(date_attr(data, rec, layout.modified)),
-        },
-        "item": item,
-    });
-
-    sink(ObjectParsed {
+    let mut source = sqlite_source_json(evidence, class, index, SCHEMA_VARIANT);
+    source["byte_offset"] = json!(record.section.offset);
+    source["record_number"] = json!(record.number);
+    Ok(ObjectParsed {
         parser: PARSER_NAME,
         kind: KEYCHAIN_ITEM_KIND,
         text,
-        json,
-    })?;
-    *index += 1;
-    Ok(())
-}
-
-/// Certificates and keys: emit one summary object (count) rather than fabricate
-/// per-record attributes whose CSSM layout we have not verified.
-fn emit_table_summary(
-    evidence: &SqliteEvidence,
-    class: &str,
-    table_id: u32,
-    record_count: usize,
-    index: i64,
-    sink: &mut dyn FnMut(ObjectParsed) -> Result<()>,
-) -> Result<()> {
-    let json = json!({
-        "platform": "macos",
-        "app": "keychain",
-        "record_type": "keychain_table_summary",
-        "format": "keychain-db",
-        "class": class,
-        "source": sqlite_source_json(evidence, class, index, SCHEMA_VARIANT),
-        "summary": {
-            "table_id": format!("0x{table_id:08x}"),
-            "record_count": record_count,
-        },
-    });
-    sink(ObjectParsed {
-        parser: PARSER_NAME,
-        kind: KEYCHAIN_ITEM_KIND,
-        text: format!("{class}: {record_count} record(s)"),
-        json,
+        json: json!({
+            "platform": "macos", "app": "keychain", "record_type": "keychain_item",
+            "format": "keychain-db", "class": class, "source": source,
+            "timestamps": {
+                "created": cssm_time_to_json(date_attr(record, layout, 0)?),
+                "modified": cssm_time_to_json(date_attr(record, layout, 1)?),
+            },
+            "item": item,
+            "recovery": recovery_json(authentication),
+        }),
     })
 }
 
-/// Collect up to `record_count` non-zero record offsets (relative to the table
-/// base) from the offset array beginning at `base + 0x1c`.
-fn collect_record_offsets(data: &[u8], base: usize, record_count: usize) -> Vec<usize> {
-    let mut offsets = Vec::with_capacity(record_count);
-    let mut i = 0;
-    // Bound the scan so a corrupt count cannot spin.
-    let max_slots = record_count.saturating_mul(2) + 64;
-    while offsets.len() < record_count && i < max_slots {
-        match be(data, base + 0x1c + 4 * i) {
-            Ok(v) if v != 0 => offsets.push(v as usize),
-            Ok(_) => {}
-            Err(_) => break,
-        }
-        i += 1;
+fn string_attr(
+    record: &Record<'_>,
+    layout: &PasswordLayout,
+    index: usize,
+) -> Result<Option<String>> {
+    if index == usize::MAX {
+        return Ok(None);
     }
-    offsets
+    let Some(value) = record.blob_attribute(index, layout.header_size)? else {
+        return Ok(None);
+    };
+    let text = std::str::from_utf8(value.bytes)
+        .context("invalid UTF-8 attribute")?
+        .trim_end_matches('\0');
+    Ok((!text.is_empty()).then(|| text.to_owned()))
 }
 
-/// Read a string/blob attribute (`[u32 len][bytes]` at `slot & !3`).
-fn string_attr(data: &[u8], rec: usize, attr_index: usize) -> Option<String> {
-    if attr_index == usize::MAX {
-        return None;
-    }
-    let slot = be(data, rec + 0x18 + 4 * attr_index).ok()?;
-    if slot == 0 {
-        return None;
-    }
-    let off = rec + (slot & !3) as usize;
-    let len = be(data, off).ok()? as usize;
-    let bytes = data.get(off + 4..off + 4 + len)?;
-    let text = String::from_utf8_lossy(bytes);
-    let trimmed = text.trim_end_matches('\0');
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_string())
-    }
-}
-
-/// Read a date attribute: a fixed 16-byte `YYYYMMDDhhmmssZ` string stored at
-/// `slot & !3` with no length prefix.
-fn date_attr(data: &[u8], rec: usize, attr_index: usize) -> Option<String> {
-    let slot = be(data, rec + 0x18 + 4 * attr_index).ok()?;
-    if slot == 0 {
-        return None;
-    }
-    let off = rec + (slot & !3) as usize;
-    let bytes = data.get(off..off + 16)?;
-    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-    let text = String::from_utf8_lossy(&bytes[..end]);
-    if text.is_empty() {
-        None
-    } else {
-        Some(text.into_owned())
-    }
-}
-
-/// Read an inline integer attribute (the slot value itself).
-fn int_attr(data: &[u8], rec: usize, attr_index: usize) -> Value {
-    if attr_index == usize::MAX {
-        return Value::Null;
-    }
-    match be(data, rec + 0x18 + 4 * attr_index) {
-        Ok(v) if v != 0 => json!(v),
-        _ => Value::Null,
-    }
+fn date_attr(record: &Record<'_>, layout: &PasswordLayout, index: usize) -> Result<Option<String>> {
+    record
+        .value(index, layout.header_size)?
+        .map(|value| {
+            let bytes = value.part(0, 16, "CSSM date")?.bytes;
+            let end = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
+            Ok(std::str::from_utf8(&bytes[..end])
+                .context("invalid UTF-8 date")?
+                .to_owned())
+        })
+        .transpose()
 }
 
 /// Parse a CSSM `YYYYMMDDhhmmssZ` (Zulu/UTC) timestamp into the shared JSON
@@ -328,26 +241,6 @@ fn cssm_time_to_json(value: Option<String>) -> Value {
         "unix_ms": dt.timestamp_millis(),
         "rfc3339": dt.to_rfc3339(),
     })
-}
-
-fn key_class(table_id: u32) -> &'static str {
-    match table_id {
-        RECORD_PUBLIC_KEY => "public_key",
-        RECORD_PRIVATE_KEY => "private_key",
-        RECORD_SYMMETRIC_KEY => "symmetric_key",
-        _ => "key",
-    }
-}
-
-fn json_or_null(value: Option<String>) -> Value {
-    value.map(Value::String).unwrap_or(Value::Null)
-}
-
-fn be(data: &[u8], offset: usize) -> Result<u32> {
-    let b = data
-        .get(offset..offset + 4)
-        .ok_or_else(|| anyhow::anyhow!("truncated keychain at offset {offset}"))?;
-    Ok(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
 }
 
 #[cfg(test)]

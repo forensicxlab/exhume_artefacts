@@ -272,11 +272,11 @@ impl StoreHeader {
             "invalid Spotlight header size {header_size}"
         );
         ensure!(
-            block0_size >= 20 && block0_size <= MAX_BLOCK_SIZE,
+            (20..=MAX_BLOCK_SIZE).contains(&block0_size),
             "invalid Spotlight map size {block0_size}"
         );
         ensure!(
-            block_size >= 32 && block_size <= MAX_BLOCK_SIZE,
+            (32..=MAX_BLOCK_SIZE).contains(&block_size),
             "invalid Spotlight page size {block_size}"
         );
         let definition_blocks = [
@@ -576,10 +576,10 @@ impl Store {
                 return json!({ "unresolved_category_list": reference });
             };
             for &index in indexes {
-                if index >= 0 {
-                    if let Some(value) = self.categories.get(&(index as u32)) {
-                        return json!(trim_localization(value));
-                    }
+                if index >= 0
+                    && let Some(value) = self.categories.get(&(index as u32))
+                {
+                    return json!(trim_localization(value));
                 }
             }
             Value::Null
@@ -660,10 +660,11 @@ fn resolve_path(id: u64, items: &HashMap<u64, (u64, Option<String>)>) -> Option<
             return None;
         }
         let (parent, name) = items.get(&current)?;
-        if let Some(name) = name {
-            if !name.is_empty() && name != "/" {
-                parts.push(name.clone());
-            }
+        if let Some(name) = name
+            && !name.is_empty()
+            && name != "/"
+        {
+            parts.push(name.clone());
         }
         current = if *parent == 0 { 2 } else { *parent };
     }
@@ -1133,7 +1134,7 @@ fn decode_apple_compression(
         CompressionAlgorithm::Zlib => COMPRESSION_ZLIB,
         CompressionAlgorithm::Lzfse => COMPRESSION_LZFSE,
     };
-    let mut capacity = expected.max(64 * 1024).min(MAX_DECOMPRESSED_BLOCK);
+    let mut capacity = expected.clamp(64 * 1024, MAX_DECOMPRESSED_BLOCK);
     loop {
         let mut output = vec![0u8; capacity];
         // SAFETY: both buffers are valid for their advertised sizes and the
@@ -1475,7 +1476,7 @@ mod tests {
         if value < 0x80 {
             return vec![value as u8];
         }
-        let bytes = ((64 - value.leading_zeros() as usize) + 7) / 8;
+        let bytes = (64 - value.leading_zeros() as usize).div_ceil(8);
         match bytes {
             1 => vec![0x80, value as u8],
             2 => vec![0xc0, (value >> 8) as u8, value as u8],

@@ -21,7 +21,9 @@
 
 use anyhow::{Context, Result, bail};
 use clap::{Arg, ArgMatches, Command};
-use exhume_artefacts::sqlcipher::{SqlCipherKey, SqlCipherProfile, inspect_database};
+use exhume_artefacts::formats::sqlite::sqlcipher::{
+    SqlCipherKey, SqlCipherProfile, inspect_database,
+};
 use exhume_artefacts::{
     CompanionSpec, ObjectParsed, Parser, ParserContext, ParserInput, ParserInputError, ParserIssue,
     ParserOptionDefault, ParserOptionSpec, ParserOptionType, ParserOptionValue, ParserOptions, cli,

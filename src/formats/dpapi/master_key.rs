@@ -164,27 +164,10 @@ impl<'a> MasterKeyFile<'a> {
         &self.metadata
     }
 
-    /// Authenticate and recover an AES-256/SHA-512 primary block using the
-    /// local-account SHA-1 password/SID derivation. Password is exact UTF-8;
-    /// it is encoded as UTF-16LE without trimming or normalization.
-    ///
-    /// This does not try NT-hash/domain/Protected Users derivations, password
-    /// history, or backup keys. Authentication failure preserves that uncertainty.
-    /// The caller can pass its existing cancellation flag; it is checked before
-    /// work and at most every 256 derivation rounds. Inputs and rounds are bounded.
-    pub fn unlock_local_password(
-        &self,
-        sid: &str,
-        password: &str,
-        cancel: Option<&AtomicBool>,
-    ) -> Result<MasterKey> {
-        check_cancel(cancel)?;
+    /// Validate the supported local-password protection and SID without running
+    /// a KDF or authenticating any key material.
+    pub fn check_local_password_protection(&self, sid: &str) -> Result<()> {
         validate_sid(sid)?;
-        if password.len() > 16 * 1024 {
-            return Err(DpapiError::LimitExceeded {
-                field: "password bytes",
-            });
-        }
         let metadata = self
             .metadata
             .primary
@@ -218,6 +201,37 @@ impl<'a> MasterKeyFile<'a> {
                 field: "AES protection ciphertext length",
             });
         }
+        Ok(())
+    }
+
+    /// Authenticate and recover an AES-256/SHA-512 primary block using the
+    /// local-account SHA-1 password/SID derivation. Password is exact UTF-8;
+    /// it is encoded as UTF-16LE without trimming or normalization.
+    ///
+    /// This does not try NT-hash/domain/Protected Users derivations, password
+    /// history, or backup keys. Authentication failure preserves that uncertainty.
+    /// The caller can pass its existing cancellation flag; it is checked before
+    /// work and at most every 256 derivation rounds. Inputs and rounds are bounded.
+    pub fn unlock_local_password(
+        &self,
+        sid: &str,
+        password: &str,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<MasterKey> {
+        check_cancel(cancel)?;
+        validate_sid(sid)?;
+        if password.len() > 16 * 1024 {
+            return Err(DpapiError::LimitExceeded {
+                field: "password bytes",
+            });
+        }
+        self.check_local_password_protection(sid)?;
+        let metadata = self
+            .metadata
+            .primary
+            .as_ref()
+            .ok_or(DpapiError::MissingMasterKey)?;
+        let protection = self.primary.as_ref().ok_or(DpapiError::MissingMasterKey)?;
         let utf16_password = Zeroizing::new(
             password
                 .encode_utf16()

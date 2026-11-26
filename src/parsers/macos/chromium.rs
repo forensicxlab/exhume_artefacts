@@ -207,7 +207,7 @@ fn emit_visits(
                 "visit_id": id,
                 "from_visit_id": row.i64(5),
                 "transition_code": transition,
-                "transition_core": transition.map(|t| core_transition(t)),
+                "transition_core": transition.map(core_transition),
             },
             "site": {
                 "url_id": row.i64(1),

@@ -28,6 +28,16 @@ pub fn run_local(positional: bool) -> Result<()> {
     .about("Run a named artefact parser and output JSONL.")
     .arg(file)
     .arg(parser)
+    .arg(Arg::new("dump_dir").long("dump-dir").value_name("DIRECTORY")
+        .help("Recover referenced local media into this derived-output directory; disabled when omitted."))
+    .arg(Arg::new("source_dir").long("source-dir").value_name("DIRECTORY").requires("dump_dir")
+        .help("Source root for local assets; inferred from the parser when possible."))
+    .arg(Arg::new("asset_limit").long("asset-byte-limit").value_name("BYTES")
+        .default_value("1073741824").value_parser(clap::value_parser!(u64).range(1..))
+        .help("Maximum bytes per requested media file (default 1 GiB)."))
+    .arg(Arg::new("dump_limit").long("dump-byte-limit").value_name("BYTES")
+        .default_value("10737418240").value_parser(clap::value_parser!(u64).range(1..))
+        .help("Maximum total recovered media bytes for this invocation (default 10 GiB)."))
     .arg(
         Arg::new("list_parsers")
             .long("list-parsers")
@@ -68,16 +78,79 @@ pub fn run_local(positional: bool) -> Result<()> {
     let file = matches
         .get_one::<String>("file")
         .context("missing file path")?;
+    let asset_output = matches
+        .get_one::<String>("dump_dir")
+        .map(std::path::PathBuf::from);
+    let asset_profile = if let Some(output) = &asset_output {
+        let profile = if let Some(profile) = matches.get_one::<String>("source_dir") {
+            std::path::PathBuf::from(profile)
+        } else {
+            parser
+                .asset_root(&std::path::Path::new(file).canonicalize()?)
+                .context("use --source-dir to select the acquired asset root")?
+        };
+        crate::assets::validate_dump_destination(&profile, output)?;
+        Some(profile)
+    } else {
+        None
+    };
+    let asset_limit = *matches
+        .get_one::<u64>("asset_limit")
+        .context("missing asset byte limit")?;
     let input = crate::input::local_input(
         &**parser,
         std::path::Path::new(file),
         &companion_overrides(&matches)?,
     )?;
     let mut count = 0usize;
+    let dump_limit = *matches
+        .get_one::<u64>("dump_limit")
+        .context("missing dump byte limit")?;
+    let mut dumped_bytes = 0u64;
     parser.run_into_with_context(
         input,
         &context,
-        &mut |object| {
+        &mut |mut object| {
+            if object.kind == "mobile.communication.attachment"
+                && let (Some(profile), Some(directory)) = (&asset_profile, &asset_output)
+            {
+                use crate::assets::{Rendition, dump_asset, local_asset_path};
+                let recovered = (|| -> Result<_> {
+                    let spec = parser
+                        .attachment_recipe(&object.json, Rendition::Original)?
+                        .context("parser does not support asset recovery")?;
+                    let path = local_asset_path(profile, &*spec)?;
+                    let mut file = std::fs::File::open(path)?;
+                    let size = spec.plaintext_size().unwrap_or(file.metadata()?.len());
+                    if size > dump_limit.saturating_sub(dumped_bytes) {
+                        bail!("Media recovery exceeds the total dump byte limit");
+                    }
+                    Ok(dump_asset(&mut file, &*spec, directory, asset_limit, None)?)
+                })();
+                object.json["attachment"]["recovery"] = match recovered {
+                    Ok(asset) => {
+                        dumped_bytes = dumped_bytes
+                            .checked_add(asset.proof.plaintext_size)
+                            .context("asset byte count overflow")?;
+                        serde_json::json!({
+                            "status": "ready",
+                            "output_file": directory.join(&asset.relative_path),
+                            "asset": asset,
+                        })
+                    }
+                    Err(error) => {
+                        let table = object.json["source"]["table"].as_str().unwrap_or("unknown");
+                        let row = &object.json["source"]["rowid"];
+                        let issue = crate::ParserIssue {
+                            code: crate::ParserIssueCode::RecordParse,
+                            unit: row.as_u64(),
+                            message: format!("Media recovery at {table} row {row}: {error}"),
+                        };
+                        eprintln!("{}", serde_json::to_string(&issue)?);
+                        serde_json::json!({"status": "unavailable"})
+                    }
+                };
+            }
             println!("{}", object.json);
             count += 1;
             Ok(())

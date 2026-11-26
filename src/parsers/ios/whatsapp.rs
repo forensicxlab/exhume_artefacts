@@ -30,6 +30,18 @@ const IOS_CONFIG: WhatsAppConfig = WhatsAppConfig {
 pub struct IosWhatsAppParser;
 
 impl Parser for IosWhatsAppParser {
+    fn asset_root(&self, primary_path: &std::path::Path) -> Option<std::path::PathBuf> {
+        primary_path.parent().map(std::path::Path::to_path_buf)
+    }
+    fn attachment_recipe(
+        &self,
+        record: &serde_json::Value,
+        rendition: crate::assets::Rendition,
+    ) -> crate::assets::Result<Option<Box<dyn crate::assets::AssetRecipe>>> {
+        crate::assets::PlaintextSpec::from_record(record, rendition)
+            .map(|spec| Some(Box::new(spec) as Box<dyn crate::assets::AssetRecipe>))
+    }
+
     fn name(&self) -> &'static str {
         PARSER_NAME
     }

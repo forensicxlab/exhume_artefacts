@@ -6,8 +6,9 @@
 //! - [`parsers`] contains platform entry points and the parser registry.
 //!
 //! Internal application engines are shared by platform entry points. Public
-//! compatibility exports keep existing parser and SQLCipher import paths valid.
+//! entry points use platform modules; SQLCipher support lives under `formats::sqlite`.
 
+pub mod assets;
 pub mod cli;
 /// Core parsing traits, types, and shared functionality.
 pub mod core;
@@ -16,8 +17,8 @@ pub mod formats;
 pub mod input;
 /// Concrete parser implementations and the parser registry.
 pub mod parsers;
-/// Open SQLCipher evidence using an already recovered raw database key.
-pub use formats::sqlite::sqlcipher;
+/// Application key envelopes, independent of discovery, prompting and indexing.
+pub mod recovery;
 
 use crate::parsers::ParserRegistry;
 use anyhow::Result;

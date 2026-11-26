@@ -4,7 +4,7 @@ use crate::core::{CompoundParserInput, ParserFileProvider, ParserInput, ParserSo
 use anyhow::{Context, Result, anyhow};
 use serde_json::{Value, json};
 use std::fs;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
@@ -27,6 +27,24 @@ pub(crate) struct SqliteSourceFile {
 
 impl SqliteEvidence {
     pub(crate) fn from_input(input: ParserInput, filename: &str) -> Result<Self> {
+        Self::from_input_with_limit(input, filename, None)
+    }
+
+    /// Bound each materialized file (primary, WAL and SHM) independently.
+    /// Enforces the limit while copying, including provider-backed sources.
+    pub(crate) fn from_input_bounded(
+        input: ParserInput,
+        filename: &str,
+        maximum: usize,
+    ) -> Result<Self> {
+        Self::from_input_with_limit(input, filename, Some(maximum))
+    }
+
+    fn from_input_with_limit(
+        input: ParserInput,
+        filename: &str,
+        maximum: Option<usize>,
+    ) -> Result<Self> {
         let tempdir = tempfile::tempdir().context("failed to create temporary SQLite directory")?;
         let path = tempdir.path().join(filename);
         let mut source_label = "<in-memory>".to_string();
@@ -35,7 +53,7 @@ impl SqliteEvidence {
 
         match input {
             ParserInput::Path(source) => {
-                fs::copy(&source, &path).with_context(|| {
+                copy_file(&source, &path, maximum).with_context(|| {
                     format!("failed to copy SQLite database from {}", source.display())
                 })?;
                 source_label = source.display().to_string();
@@ -51,7 +69,7 @@ impl SqliteEvidence {
                     let sidecar = append_suffix(&source, suffix)?;
                     if sidecar.exists() {
                         let target = append_suffix(&path, suffix)?;
-                        fs::copy(&sidecar, &target).with_context(|| {
+                        copy_file(&sidecar, &target, maximum).with_context(|| {
                             format!("failed to copy SQLite sidecar {}", sidecar.display())
                         })?;
                         copied_sidecars.push(suffix.trim_start_matches('-').to_string());
@@ -66,6 +84,9 @@ impl SqliteEvidence {
                 }
             }
             ParserInput::Bytes(bytes) => {
+                if maximum.is_some_and(|limit| bytes.len() > limit) {
+                    anyhow::bail!("SQLite input exceeds the configured byte limit");
+                }
                 fs::write(&path, bytes).context("failed to write SQLite bytes to temp file")?;
                 source_files.push(SqliteSourceFile {
                     role: "primary".to_string(),
@@ -76,10 +97,13 @@ impl SqliteEvidence {
                 });
             }
             ParserInput::ReadSeek(mut reader) => {
-                let mut bytes = Vec::new();
                 reader.seek(SeekFrom::Start(0))?;
-                reader.read_to_end(&mut bytes)?;
-                fs::write(&path, bytes).context("failed to write SQLite stream to temp file")?;
+                let mut output = LimitedOutput {
+                    output: fs::File::create(&path)?,
+                    remaining: maximum,
+                };
+                std::io::copy(&mut reader, &mut output)
+                    .context("failed to write SQLite stream to temp file")?;
                 source_files.push(SqliteSourceFile {
                     role: "primary".to_string(),
                     path: source_label.clone(),
@@ -90,7 +114,13 @@ impl SqliteEvidence {
             }
             ParserInput::Compound(compound) => {
                 source_label = compound.primary.original_path.clone();
-                write_compound_sqlite(compound, &path, &mut copied_sidecars, &mut source_files)?;
+                write_compound_sqlite(
+                    compound,
+                    &path,
+                    &mut copied_sidecars,
+                    &mut source_files,
+                    maximum,
+                )?;
             }
         }
 
@@ -125,9 +155,10 @@ fn write_compound_sqlite(
     path: &Path,
     copied_sidecars: &mut Vec<String>,
     source_files: &mut Vec<SqliteSourceFile>,
+    maximum: Option<usize>,
 ) -> Result<()> {
     let primary = compound.primary.clone();
-    copy_source_to_path(&mut *compound.provider, &primary, path)?;
+    copy_source_to_path(&mut *compound.provider, &primary, path, maximum)?;
     source_files.push(source_file_from_parser_source(&primary));
 
     for companion in compound.companions {
@@ -135,7 +166,7 @@ fn write_compound_sqlite(
             continue;
         };
         let target = append_suffix(path, suffix)?;
-        copy_source_to_path(&mut *compound.provider, &companion, &target)?;
+        copy_source_to_path(&mut *compound.provider, &companion, &target, maximum)?;
         copied_sidecars.push(suffix.trim_start_matches('-').to_string());
         source_files.push(source_file_from_parser_source(&companion));
     }
@@ -147,11 +178,56 @@ fn copy_source_to_path(
     provider: &mut dyn ParserFileProvider,
     source: &ParserSource,
     path: &Path,
+    maximum: Option<usize>,
 ) -> Result<()> {
-    let mut file = fs::File::create(path)
+    let file = fs::File::create(path)
         .with_context(|| format!("failed to create SQLite temp file {}", path.display()))?;
-    provider.copy_to(source, &mut file)?;
+    let mut output = LimitedOutput {
+        output: file,
+        remaining: maximum,
+    };
+    provider.copy_to(source, &mut output)?;
     Ok(())
+}
+
+fn copy_file(source: &Path, target: &Path, maximum: Option<usize>) -> Result<()> {
+    if maximum.is_none() {
+        fs::copy(source, target)?;
+    } else {
+        let mut input = fs::File::open(source)?;
+        let mut output = LimitedOutput {
+            output: fs::File::create(target)?,
+            remaining: maximum,
+        };
+        std::io::copy(&mut input, &mut output)?;
+    }
+    Ok(())
+}
+
+struct LimitedOutput<W> {
+    output: W,
+    remaining: Option<usize>,
+}
+impl<W: Write> Write for LimitedOutput<W> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if self
+            .remaining
+            .is_some_and(|remaining| bytes.len() > remaining)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "SQLite input exceeds the configured byte limit",
+            ));
+        }
+        let written = self.output.write(bytes)?;
+        if let Some(remaining) = self.remaining.as_mut() {
+            *remaining -= written;
+        }
+        Ok(written)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.output.flush()
+    }
 }
 
 fn source_file_from_parser_source(source: &ParserSource) -> SqliteSourceFile {

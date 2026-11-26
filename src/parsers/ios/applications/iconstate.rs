@@ -36,7 +36,7 @@ impl Parser for IosIconStateParser {
         };
         if !["buttonBar", "iconLists", "today"]
             .iter()
-            .any(|key| dict.contains_key(*key))
+            .any(|key| dict.contains_key(key))
         {
             bail!("not an iOS IconState plist: no recognised placement surfaces");
         }

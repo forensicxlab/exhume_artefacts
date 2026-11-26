@@ -10,12 +10,18 @@ readme = "README.md"
 authors = ["k1nd0ne"]
 license = "GPL-3.0-only"
 keywords = ["forensics", "dfir", "artefacts", "parsers", "exhume"]
-include = ["Cargo.toml", "LICENSE", "README.md", "src/**/*.rs", "examples/**/*.rs"]
+include = ["Cargo.toml", "LICENSE", "README.md", "src/**/*.rs", "src/formats/dpapi/fixtures/*", "src/formats/keychain/fixtures/*", "src/formats/gnome_keyring/fixtures/*", "src/formats/kwallet/fixtures/*", "src/recovery/fixtures/*", "examples/**/*.rs", "tests/**/*.rs", "tests/fixtures/*", "tools/fixtures/*"]
+
+[[example]]
+name = "recover_signal_linux"
+required-features = ["sqlcipher"]
 
 [features]
 # Uses the same native SQLite library as SQLx in applications embedding this crate.
 # macOS uses CommonCrypto; other targets need the SQLCipher build's crypto provider.
 sqlcipher = ["libsqlite3-sys/bundled-sqlcipher"]
+# Portable static crypto for native Windows release binaries.
+sqlcipher-vendored-openssl = ["sqlcipher", "libsqlite3-sys/bundled-sqlcipher-vendored-openssl"]
 
 [dependencies]
 anyhow = "1.0.100"
@@ -27,7 +33,7 @@ evtx = "0.8.5"
 goblin = "0.10"
 md5 = "0.7"
 sha2 = "0.10"
-sha-1 = "0.10"
+sha-1 = { version = "0.10", features = ["compress"] }
 hex = "0.4"
 libsqlite3-sys = "0.30.1"
 plist = "1.7"
@@ -41,6 +47,10 @@ exhume_body = "=0.7.0"
 tempfile = "3.26.0"
 zeroize = "1"
 aes = { version = "0.8", features = ["zeroize"] }
+aes-gcm = { version = "0.10", features = ["zeroize"] }
 cbc = { version = "0.1", features = ["zeroize"] }
 hmac = "0.12"
 subtle = "2.6"
+des = { version = "0.8", features = ["zeroize"] }
+blowfish = { version = "0.9.1", features = ["zeroize"] }
+pbkdf2 = "0.12"

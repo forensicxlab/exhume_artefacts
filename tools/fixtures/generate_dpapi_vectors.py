@@ -50,13 +50,8 @@ values={
     'BLOB_ENTROPY':blob(payload,b'context'),
     'BLOB_LEGACY_SIGNATURE':blob(payload,legacy=True),
 }
-destination=Path(__file__).resolve().parents[1]/'src/formats/dpapi/fixtures.rs'
-text='//! Synthetic, deterministic vectors generated with PyCryptodome and checked\n//! with Impacket 0.13.1. Contains no acquired user data.\n'
-text+='pub(crate) const PASSWORD: &str = "fixture password ☃";\n'
-text+='pub(crate) const SID: &str = "'+sid+'";\n'
-text+='pub(crate) const GUID: &str = "'+guid+'";\n'
+destination=Path(__file__).resolve().parents[2]/'src/formats/dpapi/fixtures'
+destination.mkdir(parents=True,exist_ok=True)
 for name,value in values.items():
-    text+='pub(crate) const '+name+': &str = "'+value.hex()+'";\n'
-destination.write_text(text)
-subprocess.run(['rustfmt', '--edition', '2024', str(destination)], check=True)
+    (destination/(name.lower()+'.hex')).write_text(value.hex())
 print('Generated four synthetic interoperability vectors; reference authentication passed.')

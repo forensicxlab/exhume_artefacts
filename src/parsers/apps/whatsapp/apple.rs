@@ -607,7 +607,6 @@ fn emit_message(
             cfg,
             row,
             evidence,
-            message_pk,
             text,
             classification.type_family,
             media,
@@ -622,12 +621,12 @@ fn emit_attachment(
     cfg: &WhatsAppConfig,
     row: &SqliteStatement<'_>,
     evidence: &SqliteEvidence,
-    message_pk: i64,
     message_text: Option<String>,
     type_family: &'static str,
     media: Value,
     sink: &mut dyn FnMut(ObjectParsed) -> Result<()>,
 ) -> Result<()> {
+    let message_pk = row.i64(0).context("message row missing Z_PK")?;
     let media_pk = row.i64(19).context("media row missing Z_PK")?;
     let local_path = row.text(20);
     let remote_url = row.text(21);
@@ -1013,30 +1012,31 @@ fn embedded_preview_json(row: &SqliteStatement<'_>, index: i32) -> Value {
 }
 
 fn embedded_image_range(blob: &[u8]) -> Option<(&'static str, usize, usize)> {
-    if let Some(start) = find_bytes(blob, &[0xff, 0xd8, 0xff]) {
-        if let Some(relative_end) = find_bytes(&blob[start + 2..], &[0xff, 0xd9]) {
-            return Some(("image/jpeg", start, start + 2 + relative_end + 2));
-        }
+    if let Some(start) = find_bytes(blob, &[0xff, 0xd8, 0xff])
+        && let Some(relative_end) = find_bytes(&blob[start + 2..], &[0xff, 0xd9])
+    {
+        return Some(("image/jpeg", start, start + 2 + relative_end + 2));
     }
 
-    if let Some(start) = find_bytes(blob, b"\x89PNG\r\n\x1a\n") {
-        if let Some(relative_iend) = find_bytes(&blob[start..], b"IEND") {
-            return Some(("image/png", start, start + relative_iend + 8));
-        }
+    if let Some(start) = find_bytes(blob, b"\x89PNG\r\n\x1a\n")
+        && let Some(relative_iend) = find_bytes(&blob[start..], b"IEND")
+    {
+        return Some(("image/png", start, start + relative_iend + 8));
     }
 
-    if let Some(start) = find_bytes(blob, b"RIFF") {
-        if blob.len() >= start + 12 && &blob[start + 8..start + 12] == b"WEBP" {
-            let size = u32::from_le_bytes([
-                blob[start + 4],
-                blob[start + 5],
-                blob[start + 6],
-                blob[start + 7],
-            ]) as usize;
-            let end = start.saturating_add(8).saturating_add(size);
-            if end <= blob.len() {
-                return Some(("image/webp", start, end));
-            }
+    if let Some(start) = find_bytes(blob, b"RIFF")
+        && blob.len() >= start + 12
+        && &blob[start + 8..start + 12] == b"WEBP"
+    {
+        let size = u32::from_le_bytes([
+            blob[start + 4],
+            blob[start + 5],
+            blob[start + 6],
+            blob[start + 7],
+        ]) as usize;
+        let end = start.saturating_add(8).saturating_add(size);
+        if end <= blob.len() {
+            return Some(("image/webp", start, end));
         }
     }
 

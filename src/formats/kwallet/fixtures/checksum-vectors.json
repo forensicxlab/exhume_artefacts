@@ -1,0 +1,50 @@
+[
+  {
+    "length": 0,
+    "checksum": "1ef84498ecf608147d1332b9cfd7be33a318f5dc"
+  },
+  {
+    "length": 1,
+    "checksum": "964486dafb597c8733d15807e3c1a5d4d3bf2021"
+  },
+  {
+    "length": 3,
+    "checksum": "6d69f3a837e499547139b7c4c37df1ed8b76bfb7"
+  },
+  {
+    "length": 55,
+    "checksum": "5b27e9296d43e1eb05106344d7a6c1895e64ef3a"
+  },
+  {
+    "length": 56,
+    "checksum": "fd4b0eb42fc4797bf29f9da5d65f2e04b1dc5a7c"
+  },
+  {
+    "length": 63,
+    "checksum": "0864c6ece40b29876cc3493bdf99d814f4869241"
+  },
+  {
+    "length": 64,
+    "checksum": "638880149339522ff0cb65e473410aed41d0db53"
+  },
+  {
+    "length": 65,
+    "checksum": "87185aa364bb7eafe8875405910d3eca23a90f57"
+  },
+  {
+    "length": 127,
+    "checksum": "d3148c90939163d2495dec371aef88263d18f362"
+  },
+  {
+    "length": 128,
+    "checksum": "a675b720dbae4d69b38975f26b1d43c34a4f4c53"
+  },
+  {
+    "length": 129,
+    "checksum": "18d6b48b726ec8a311930eca2008c8b2ee1d2d45"
+  },
+  {
+    "length": 1000,
+    "checksum": "82de713af441b969646c3a261abda077c3db2672"
+  }
+]

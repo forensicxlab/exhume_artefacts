@@ -8,11 +8,9 @@
 pub mod android;
 pub(crate) mod apps;
 pub mod ios;
+pub mod linux;
 pub mod macos;
-pub mod mobile;
 mod registry;
 pub mod windows;
 
 pub use registry::{ParserRegistry, build_registry};
-// Preserve the original public Windows parser module paths.
-pub use windows::{evtx, pe, pml};

@@ -66,7 +66,9 @@ impl StringTable {
             }
 
             let utf16_data: Vec<u16> = utf16_buf
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| u16::from_le_bytes([c[0], c[1]]))
                 .collect();
 
@@ -341,7 +343,9 @@ fn read_detail_string(cursor: &mut Cursor<&[u8]>, info: (bool, usize)) -> Option
         let mut bytes = vec![0u8; byte_len];
         cursor.read_exact(&mut bytes).ok()?;
         let utf16: Vec<u16> = bytes
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| u16::from_le_bytes([c[0], c[1]]))
             .collect();
         Some(
@@ -359,7 +363,9 @@ fn read_utf16_multisz(cursor: &mut Cursor<&[u8]>) -> String {
         return String::new();
     }
     let utf16: Vec<u16> = remaining
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| u16::from_le_bytes([c[0], c[1]]))
         .collect();
     let parts: Vec<String> = String::from_utf16_lossy(&utf16)
@@ -410,7 +416,9 @@ fn decode_registry_data(cursor: &mut Cursor<&[u8]>, reg_type: u32, length: usize
         1 | 2 => {
             let bytes = read_exact_vec(cursor, n)?;
             let utf16: Vec<u16> = bytes
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| u16::from_le_bytes([c[0], c[1]]))
                 .collect();
             Some(json!(
@@ -771,7 +779,9 @@ fn parse_registry_details(
                         if name_size > 0 {
                             let name_bytes = read_exact_vec(cur, name_size).unwrap_or_default();
                             let utf16: Vec<u16> = name_bytes
-                                .chunks_exact(2)
+                                .as_chunks::<2>()
+                                .0
+                                .iter()
                                 .map(|c| u16::from_le_bytes([c[0], c[1]]))
                                 .collect();
                             let name = String::from_utf16_lossy(&utf16)
@@ -1472,7 +1482,9 @@ fn extract_raw_details(blob: &[u8]) -> Option<String> {
 
     if blob.len() >= 2 {
         let utf16: Vec<u16> = blob
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| u16::from_le_bytes([c[0], c[1]]))
             .collect();
         let utf16_text = String::from_utf16_lossy(&utf16)

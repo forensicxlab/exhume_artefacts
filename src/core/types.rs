@@ -48,6 +48,9 @@ pub enum CompanionPathRule {
     /// this filename (a sibling in the same directory). Used e.g. to pair Apple
     /// Mail's "Envelope Index" with its sibling "Protected Index".
     Sibling(&'static str),
+    /// Resolve a companion by replacing the primary filename's extension.
+    /// For example, pair `wallet.kwl` with `wallet.salt` using `"salt"`.
+    Extension(&'static str),
 }
 
 /// Description of a companion file a parser can consume with a primary input.
@@ -79,6 +82,14 @@ impl CompanionSpec {
         Self {
             role,
             path_rule: CompanionPathRule::Sibling(filename),
+            required: false,
+        }
+    }
+
+    pub const fn optional_extension(role: &'static str, extension: &'static str) -> Self {
+        Self {
+            role,
+            path_rule: CompanionPathRule::Extension(extension),
             required: false,
         }
     }

@@ -80,23 +80,23 @@ pub(crate) fn decode_bookmark(data: &[u8]) -> Option<BookmarkTarget> {
 
     let mut target = BookmarkTarget::default();
 
-    if let Some(&off) = values.get(&KEY_PATH) {
-        if let Some(offsets) = read_array_offsets(body, off) {
-            let components: Vec<String> = offsets
-                .iter()
-                .filter_map(|&o| read_string(body, o))
-                .collect();
-            if !components.is_empty() {
-                target.file_name = components.last().cloned();
-                target.path = Some(format!("/{}", components.join("/")));
-                target.components = components;
-            }
+    if let Some(&off) = values.get(&KEY_PATH)
+        && let Some(offsets) = read_array_offsets(body, off)
+    {
+        let components: Vec<String> = offsets
+            .iter()
+            .filter_map(|&o| read_string(body, o))
+            .collect();
+        if !components.is_empty() {
+            target.file_name = components.last().cloned();
+            target.path = Some(format!("/{}", components.join("/")));
+            target.components = components;
         }
     }
-    if let Some(&off) = values.get(&KEY_CNID_PATH) {
-        if let Some(offsets) = read_array_offsets(body, off) {
-            target.cnid_count = Some(offsets.len());
-        }
+    if let Some(&off) = values.get(&KEY_CNID_PATH)
+        && let Some(offsets) = read_array_offsets(body, off)
+    {
+        target.cnid_count = Some(offsets.len());
     }
     target.volume_path = values
         .get(&KEY_VOLUME_PATH)
@@ -129,7 +129,9 @@ fn read_array_offsets(body: &[u8], offset: usize) -> Option<Vec<usize>> {
         return None;
     }
     Some(
-        data.chunks_exact(4)
+        data.as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]) as usize)
             .collect(),
     )
@@ -172,7 +174,7 @@ pub(crate) mod tests_support {
             body.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
             body.extend_from_slice(&TYPE_STRING.to_le_bytes());
             body.extend_from_slice(bytes);
-            while body.len() % 4 != 0 {
+            while !body.len().is_multiple_of(4) {
                 body.push(0);
             }
         }

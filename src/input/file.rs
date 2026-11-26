@@ -52,6 +52,56 @@ pub(crate) struct FileEvidence {
 }
 
 impl FileEvidence {
+    /// Read one declared companion with its own bound, retaining provenance
+    /// only for files actually read. Input assembly owns companion discovery.
+    pub(crate) fn read_primary_with_companion_bounded(
+        input: ParserInput,
+        role: &str,
+        maximum: usize,
+        companion_maximum: usize,
+    ) -> Result<(Self, Option<Vec<u8>>)> {
+        let ParserInput::Compound(mut compound) = input else {
+            return Self::read_primary_bounded(input, maximum).map(|evidence| (evidence, None));
+        };
+        let mut sources = compound
+            .companions
+            .iter()
+            .filter(|source| source.role == role);
+        let source = sources.next();
+        anyhow::ensure!(sources.next().is_none(), "duplicate companion role {role}");
+        let mut primary = LimitedBytes {
+            bytes: Vec::new(),
+            maximum,
+        };
+        compound
+            .provider
+            .copy_to(&compound.primary, &mut primary)
+            .context("failed to read bounded primary compound input")?;
+        let mut source_files = vec![FileRef::from_source(&compound.primary)];
+        let companion = if let Some(source) = source {
+            let mut writer = LimitedBytes {
+                bytes: Vec::new(),
+                maximum: companion_maximum,
+            };
+            compound
+                .provider
+                .copy_to(source, &mut writer)
+                .with_context(|| format!("failed to read bounded companion {role}"))?;
+            source_files.push(FileRef::from_source(source));
+            Some(writer.bytes)
+        } else {
+            None
+        };
+        Ok((
+            Self {
+                bytes: primary.bytes,
+                source_label: compound.primary.original_path,
+                source_files,
+            },
+            companion,
+        ))
+    }
+
     /// Read only the primary input with an enforced byte limit, including
     /// provider-backed inputs whose length is not known before copying.
     pub(crate) fn read_primary_bounded(input: ParserInput, maximum: usize) -> Result<Self> {
