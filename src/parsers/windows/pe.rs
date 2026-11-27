@@ -4,14 +4,44 @@
 //! extracting metadata, sections, imports, exports, rich headers, and more.
 
 use crate::core::{ObjectParsed, Parser, ParserInput};
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use goblin::pe::PE;
 use md5;
 use scroll::Pread;
 use serde_json::json;
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
-use std::io::{Read, Seek}; // <- add Read because you call read_to_end
+use std::io::{Cursor, Read, Seek, SeekFrom};
+
+/// Reject extension-only candidates before materializing a potentially huge file.
+/// Full parsing still reports malformed PE structures after these two signatures.
+fn validate_pe_header(source: &mut (impl Read + Seek)) -> Result<()> {
+    source.seek(SeekFrom::Start(0))?;
+    let mut dos = [0u8; 64];
+    source
+        .read_exact(&mut dos)
+        .context("truncated PE DOS header")?;
+    ensure!(&dos[..2] == b"MZ", "not a PE file: DOS signature is absent");
+    let offset = u32::from_le_bytes(dos[60..64].try_into()?);
+    source.seek(SeekFrom::Start(u64::from(offset)))?;
+    let mut signature = [0u8; 4];
+    source
+        .read_exact(&mut signature)
+        .context("truncated PE signature")?;
+    ensure!(
+        &signature == b"PE\0\0",
+        "not a PE file: PE signature is absent"
+    );
+    source.seek(SeekFrom::Start(0))?;
+    Ok(())
+}
+
+fn read_pe_bytes(mut source: impl Read + Seek) -> Result<Vec<u8>> {
+    validate_pe_header(&mut source)?;
+    let mut bytes = Vec::new();
+    source.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
 
 /// A parser for Windows Portable Executable (PE) files.
 ///
@@ -147,14 +177,12 @@ impl Parser for WindowsPeParser {
         sink: &mut dyn FnMut(ObjectParsed) -> Result<()>,
     ) -> Result<()> {
         let data = match input {
-            ParserInput::Path(p) => std::fs::read(p)?,
-            ParserInput::Bytes(b) => b,
-            ParserInput::ReadSeek(mut rs) => {
-                let mut b = Vec::new();
-                rs.seek(std::io::SeekFrom::Start(0))?;
-                rs.read_to_end(&mut b)?;
+            ParserInput::Path(p) => read_pe_bytes(std::fs::File::open(p)?)?,
+            ParserInput::Bytes(b) => {
+                validate_pe_header(&mut Cursor::new(&b))?;
                 b
             }
+            ParserInput::ReadSeek(rs) => read_pe_bytes(rs)?,
             ParserInput::Compound(_) => {
                 anyhow::bail!("windows_pe does not support compound parser input")
             }
@@ -405,5 +433,58 @@ impl Parser for WindowsPeParser {
         })?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct LargeNonPe {
+        position: u64,
+        read: usize,
+    }
+    impl Read for LargeNonPe {
+        fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+            assert!(
+                bytes.len() <= 64,
+                "must validate before reading the full file"
+            );
+            bytes.fill(0);
+            self.read += bytes.len();
+            self.position += bytes.len() as u64;
+            Ok(bytes.len())
+        }
+    }
+    impl Seek for LargeNonPe {
+        fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+            self.position = match position {
+                SeekFrom::Start(n) => n,
+                _ => unreachable!(),
+            };
+            Ok(self.position)
+        }
+    }
+    #[test]
+    fn non_pe_stream_is_rejected_after_a_bounded_read() {
+        let mut stream = LargeNonPe {
+            position: 0,
+            read: 0,
+        };
+        assert!(read_pe_bytes(&mut stream).is_err());
+        assert_eq!(stream.read, 64);
+    }
+    #[test]
+    fn header_probe_checks_offset_signature_and_preserves_full_input() {
+        let mut bytes = vec![0; 1024];
+        bytes[..2].copy_from_slice(b"MZ");
+        bytes[60..64].copy_from_slice(&128u32.to_le_bytes());
+        bytes[128..132].copy_from_slice(b"PE\0\0");
+        assert_eq!(read_pe_bytes(Cursor::new(&bytes)).unwrap(), bytes);
+        bytes[128] = b'X';
+        assert!(read_pe_bytes(Cursor::new(&bytes)).is_err());
+        bytes[60..64].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(read_pe_bytes(Cursor::new(&bytes)).is_err());
+        assert!(read_pe_bytes(Cursor::new(b"MZ")).is_err());
     }
 }
